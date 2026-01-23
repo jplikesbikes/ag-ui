@@ -69,6 +69,7 @@ class ADKAgent:
         # Configuration
         run_config_factory: Optional[Callable[[RunAgentInput], ADKRunConfig]] = None,
         use_in_memory_services: bool = True,
+        add_augi_context_to_state: bool = True,
 
         # Tool configuration
         execution_timeout_seconds: int = 600,  # 10 minutes
@@ -101,6 +102,7 @@ class ADKAgent:
             credential_service: Authentication credential storage
             run_config_factory: Function to create RunConfig per request
             use_in_memory_services: Use in-memory implementations for unspecified services
+            add_agui_context_to_state: Whether to add AG-UI context from RunInput to the adk session state
             execution_timeout_seconds: Timeout for entire execution
             tool_timeout_seconds: Timeout for individual tool calls
             max_concurrent_executions: Maximum concurrent background executions
@@ -149,6 +151,7 @@ class ADKAgent:
             self._memory_service = memory_service
             self._credential_service = credential_service
         
+        self.add_augi_context_to_state = add_augi_context_to_state
         
         # Session lifecycle management - use singleton
         # Use provided session service or create default based on use_in_memory_services
@@ -483,7 +486,7 @@ class ADKAgent:
     def _default_run_config(self, input: RunAgentInput) -> ADKRunConfig:
         """Create default RunConfig with SSE streaming enabled.
 
-        Context from RunAgentInput is always stored in session state under the
+        Context from RunAgentInput is by default stored in session state under the
         '_ag_ui_context' key (CONTEXT_STATE_KEY), making it accessible to both
         tools (via tool_context.state) and instruction providers (via ctx.state).
 
@@ -1414,7 +1417,7 @@ class ADKAgent:
             # Context from RunAgentInput is stored under _ag_ui_context key,
             # making it accessible via tool_context.state['_ag_ui_context']
             state_with_context = dict(input.state) if input.state else {}
-            if input.context:
+            if input.context and self.add_augi_context_to_state:
                 state_with_context[CONTEXT_STATE_KEY] = [
                     {"description": ctx.description, "value": ctx.value}
                     for ctx in input.context

@@ -11,8 +11,6 @@ logger = logging.getLogger(__name__)
 
 # Keys used to store AG-UI metadata in session state for recovery after restart
 THREAD_ID_STATE_KEY = "_ag_ui_thread_id"
-APP_NAME_STATE_KEY = "_ag_ui_app_name"
-USER_ID_STATE_KEY = "_ag_ui_user_id"
 CONTEXT_STATE_KEY = "_ag_ui_context"
 
 
@@ -152,8 +150,6 @@ class SessionManager:
         state = {
             **(initial_state or {}),
             THREAD_ID_STATE_KEY: thread_id,
-            APP_NAME_STATE_KEY: app_name,
-            USER_ID_STATE_KEY: user_id
         }
 
         session = await self._session_service.create_session(
