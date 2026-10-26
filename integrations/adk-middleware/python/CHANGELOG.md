@@ -217,6 +217,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An answered tool call no longer stays in `pending_tool_calls`. Clients echo
+  back the state they were given, and that echo was written after the answer
+  removed the call, putting it back; every answered call then stayed pending
+  for the life of the thread. `pending_tool_calls` is now a backend-managed key
+  that run input cannot overwrite, like `lro_tool_call_id_remap` (#1168).
 - A client restored from a messages snapshot (`/agents/state`,
   `emit_messages_snapshot`, or `adk_events_to_messages`) no longer has its
   history re-run on the next turn. The snapshot's IDs are not the ones the

@@ -92,6 +92,9 @@ from .session_manager import (
 # otherwise internal metadata (e.g. LRO ID remaps) is lost between requests.
 _INTERNAL_STATE_KEYS = frozenset({
     "lro_tool_call_id_remap",
+    # Accepting a tool result removes its call from this list; a client echoing
+    # its earlier snapshot would put the answered call back.
+    "pending_tool_calls",
     CONTEXT_STATE_KEY,
     THREAD_ID_STATE_KEY,
     APP_NAME_STATE_KEY,

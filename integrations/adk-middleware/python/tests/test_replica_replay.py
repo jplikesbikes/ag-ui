@@ -540,3 +540,33 @@ async def test_restored_tool_result_is_not_submitted_again(store, restore_pod):
     )
     assert not [e.message for e in events if e.type == EventType.RUN_ERROR]
     assert calls == ["question", "tool result", "question"]
+
+
+@pytest.mark.asyncio
+async def test_echoed_state_does_not_restore_an_answered_call(store):
+    """A client echoes back the state it was given, `pending_tool_calls` included.
+
+    Accepting a tool result removes its call from the pending list; the echo, written
+    after that, must not put it back, or every answered call stays pending for the
+    life of the thread.
+    """
+    calls: list = []
+    agent = _chart_replica(store, calls)
+    question = UserMessage(id="u-1", role="user", content="Chart my usage")
+    asked = await collect(agent, run_input(THREAD, "run-1", [question], tools=CHART_TOOLS))
+    call_id, _ = tool_call(asked, "render_chart")
+    session = await store.get_session(app_name=APP, user_id=USER_ID, session_id=THREAD)
+    echoed = dict(session.state)
+    assert call_id in echoed["pending_tool_calls"]
+
+    answer = ToolMessage(id="t-1", role="tool", tool_call_id=call_id, content="{}")
+    await collect(
+        agent,
+        run_input(
+            THREAD, "run-2", [question, answer], tools=CHART_TOOLS, state=echoed
+        ),
+    )
+
+    session = await store.get_session(app_name=APP, user_id=USER_ID, session_id=THREAD)
+    assert calls == ["question", "tool result"]
+    assert call_id not in (session.state.get("pending_tool_calls") or [])
