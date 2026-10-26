@@ -5,7 +5,7 @@
 import base64
 import dataclasses
 from collections.abc import Iterable, Mapping
-from typing import AsyncGenerator, Optional, Dict, Any, List
+from typing import AsyncGenerator, Optional, Dict, Any, List, Set
 import uuid
 
 from google.genai import types
@@ -1605,9 +1605,12 @@ def adk_events_to_messages(events: List[ADKEvent]) -> List[Message]:
 
         # Handle function responses as ToolMessages
         if function_responses:
-            for fr in function_responses:
+            for index, fr in enumerate(function_responses):
                 tool_message = ToolMessage(
-                    id=str(uuid.uuid4()),
+                    # Derived from the event, like the reasoning message's id, so
+                    # every read of the session gives a restored client the same
+                    # ids to send back.
+                    id=f"{event_id}-tool-{index}",
                     role="tool",
                     content=_serialize_tool_response(fr.response) if hasattr(fr, 'response') else "",
                     tool_call_id=fr.id if hasattr(fr, 'id') and fr.id else str(uuid.uuid4())
@@ -1667,3 +1670,18 @@ def adk_events_to_messages(events: List[ADKEvent]) -> List[Message]:
                 messages.append(assistant_message)
 
     return messages
+
+
+def session_history_message_ids(events: List[ADKEvent]) -> Set[str]:
+    """Return the IDs a client restored from these events sends back as history.
+
+    That is every message ID ``adk_events_to_messages`` gives the events, plus
+    the ``tool_call_id`` of every tool result, so a result is recognized by the
+    call it answers even when the client re-keys the message.
+    """
+    ids: Set[str] = set()
+    for message in adk_events_to_messages(events):
+        ids.add(message.id)
+        if isinstance(message, ToolMessage):
+            ids.add(message.tool_call_id)
+    return ids

@@ -217,6 +217,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A client restored from a messages snapshot (`/agents/state`,
+  `emit_messages_snapshot`, or `adk_events_to_messages`) no longer has its
+  history re-run on the next turn. The snapshot's IDs are not the ones the
+  client first sent, so no processed-message ledger held them, and a resend
+  re-submitted answered tool results and re-ran earlier user messages, on every
+  replica. History the session already contains now counts as processed, read
+  from the session's events rather than the ledger, so it holds on any replica
+  and restoring does not grow the ledger. Tool-result messages get stable IDs
+  (`{event_id}-tool-{n}`) instead of a fresh UUID on every read.
 - A client tool result now resumes the agent on ADK 2.12 when the client's
   history does not include the assistant message with the tool call (#3103).
   The `FunctionResponse` was named `"unknown"`, and ADK 2.12 re-dispatches a

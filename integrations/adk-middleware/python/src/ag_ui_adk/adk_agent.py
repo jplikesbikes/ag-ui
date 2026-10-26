@@ -76,6 +76,7 @@ from google.genai import types
 from .event_translator import (
     EventTranslator,
     adk_events_to_messages,
+    session_history_message_ids,
     CONFIRM_CHANGES_TOOL_NAME,
     REQUEST_CONFIRMATION_TOOL_NAME,
 )
@@ -2460,17 +2461,32 @@ class ADKAgent:
         backend_session_id = await self._known_backend_session_id(
             app_name, session_id, user_id
         )
+        # A client restored from a messages snapshot re-sends the session's own
+        # history under the snapshot's IDs, which no ledger holds, on any
+        # replica. What the session already contains has been processed, so
+        # those IDs count too. They are derived on each read and never marked,
+        # so restoring does not grow the ledger.
+        history_ids: Set[str] = set()
         if backend_session_id:
+            # One backend read serves both the ledger and the history.
+            cache_token = self._session_manager.start_session_read_cache()
             try:
                 await self._session_manager.hydrate_processed_message_ids(
                     app_name, session_id, backend_session_id, user_id=user_id
                 )
+                session = await self._session_manager.get_session(
+                    backend_session_id, app_name, user_id, raise_on_error=True
+                )
             except Exception as exc:
                 _log_session_lookup_failure(session_id, app_name, user_id)
                 raise _SessionLookupError from exc
+            finally:
+                self._session_manager.stop_session_read_cache(cache_token)
+            if session is not None:
+                history_ids = session_history_message_ids(session.events)
         processed_ids = self._session_manager.get_processed_message_ids(
             app_name, session_id, user_id=user_id
-        )
+        ) | history_ids
 
         # Filter out all processed messages, maintaining chronological order
         unseen: List[Any] = []

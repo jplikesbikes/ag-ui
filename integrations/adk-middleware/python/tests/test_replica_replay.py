@@ -30,7 +30,7 @@ from ag_ui.core import (
 )
 from ag_ui_adk import ADKAgent, AGUIToolset
 from ag_ui_adk.endpoint import create_adk_app
-from ag_ui_adk.event_translator import EventTranslator
+from ag_ui_adk.event_translator import EventTranslator, adk_events_to_messages
 from ag_ui_adk.session_manager import SessionManager
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.apps import App, ResumabilityConfig
@@ -448,3 +448,95 @@ async def test_failed_ledger_read_does_not_execute_and_can_be_retried(
     retried = await collect(agent_a, request)
     assert not [e for e in retried if e.type == EventType.RUN_ERROR]
     assert llm_a.turn_count + llm_b.turn_count == 3
+
+
+async def _snapshot(store):
+    """The history a reloaded client restores from (``/agents/state``)."""
+    session = await store.get_session(
+        app_name=APP, user_id=USER_ID, session_id=THREAD
+    )
+    return adk_events_to_messages(session.events)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_message_ids_are_stable_across_reads(store):
+    """A restored client re-sends snapshot ids, so every read must mint the same ones."""
+    calls: list = []
+    agent = _chart_replica(store, calls)
+    question = UserMessage(id="u-1", role="user", content="Chart my usage")
+    asked = await collect(agent, run_input(THREAD, "run-1", [question], tools=CHART_TOOLS))
+    call_id, _ = tool_call(asked, "render_chart")
+    await collect(
+        agent,
+        run_input(
+            THREAD,
+            "run-2",
+            [question, ToolMessage(id="t-1", role="tool", tool_call_id=call_id, content="{}")],
+            tools=CHART_TOOLS,
+        ),
+    )
+
+    first, second = await _snapshot(store), await _snapshot(store)
+
+    assert any(m.role == "tool" for m in first)
+    assert [m.id for m in first] == [m.id for m in second]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restore_pod", ["same", "other"])
+async def test_restored_snapshot_is_not_new_work(store, restore_pod):
+    """A reloaded client re-sends the snapshot's ids, not the ones it first sent.
+
+    None of them is in the ledger, on any pod: the session's own history has to
+    count as processed, or the next turn re-runs every earlier user message.
+    """
+    agent_a, llm_a = _replica(store)
+    await collect(agent_a, run_input(THREAD, "run-1", [TURN_1]))
+    after_first_turn = await _session_events(store)
+    restored = await _snapshot(store)
+    assert TURN_1.id not in {m.id for m in restored}
+
+    agent_b, llm_b = (agent_a, llm_a) if restore_pod == "same" else _replica(store)
+    unseen = await agent_b._get_unseen_messages(
+        run_input(THREAD, "run-2", restored + [TURN_2])
+    )
+    assert [m.id for m in unseen] == [TURN_2.id]
+
+    await collect(agent_b, run_input(THREAD, "run-2", restored))
+    assert await _session_events(store) == after_first_turn
+    assert llm_a.turn_count + (llm_b.turn_count if llm_b is not llm_a else 0) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restore_pod", ["same", "other"])
+async def test_restored_tool_result_is_not_submitted_again(store, restore_pod):
+    """A reload after a frontend tool round trip must not resubmit the answer."""
+    calls: list = []
+    agent_a = _chart_replica(store, calls)
+    question = UserMessage(id="u-1", role="user", content="Chart my usage")
+    asked = await collect(agent_a, run_input(THREAD, "run-1", [question], tools=CHART_TOOLS))
+    call_id, _ = tool_call(asked, "render_chart")
+    await collect(
+        agent_a,
+        run_input(
+            THREAD,
+            "run-2",
+            [question, ToolMessage(id="t-1", role="tool", tool_call_id=call_id, content="{}")],
+            tools=CHART_TOOLS,
+        ),
+    )
+    assert calls == ["question", "tool result"]
+
+    restored = await _snapshot(store)
+    follow_up = UserMessage(id="u-2", role="user", content="Another chart")
+    agent_b = agent_a if restore_pod == "same" else _chart_replica(store, calls)
+    unseen = await agent_b._get_unseen_messages(
+        run_input(THREAD, "run-3", restored + [follow_up], tools=CHART_TOOLS)
+    )
+    assert [m.id for m in unseen] == [follow_up.id]
+
+    events = await collect(
+        agent_b, run_input(THREAD, "run-3", restored + [follow_up], tools=CHART_TOOLS)
+    )
+    assert not [e.message for e in events if e.type == EventType.RUN_ERROR]
+    assert calls == ["question", "tool result", "question"]
