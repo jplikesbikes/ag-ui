@@ -5,13 +5,13 @@
 import base64
 import dataclasses
 from collections.abc import Iterable, Mapping
-from typing import AsyncGenerator, Optional, Dict, Any, List, Set
+from typing import AsyncGenerator, Optional, Dict, Any, List, Set, Tuple
 import uuid
 
 from google.genai import types
 
 from ag_ui.core import (
-    BaseEvent, EventType,
+    BaseEvent, EventType, ActivitySnapshotEvent, ActivityMessage,
     TextMessageStartEvent, TextMessageContentEvent, TextMessageEndEvent,
     ToolCallStartEvent, ToolCallArgsEvent, ToolCallEndEvent,
     ToolCallResultEvent, StateSnapshotEvent, StateDeltaEvent,
@@ -25,6 +25,7 @@ from ag_ui.core import (
     Interrupt,
 )
 import json
+from ag_ui_a2ui_toolkit import A2UI_OPERATIONS_KEY
 from google.adk.events import Event as ADKEvent
 
 from .config import PredictStateMapping, normalize_predict_state
@@ -40,6 +41,32 @@ logger = logging.getLogger(__name__)
 REQUEST_CONFIRMATION_TOOL_NAME = "adk_request_confirmation"
 # Synthetic tool the predictive-state flow emits to ask the user to review changes.
 CONFIRM_CHANGES_TOOL_NAME = "confirm_changes"
+
+# ``UiWidget.provider`` of an A2UI surface put on an event with ADK's
+# ``tool_context.render_ui_widget``; its payload carries the surface's A2UI
+# messages under ``a2ui_operations``.
+A2UI_WIDGET_PROVIDER = "a2ui"
+# The activity type the A2UI middleware emits and A2UI renderers draw.
+A2UI_ACTIVITY_TYPE = "a2ui-surface"
+
+
+def a2ui_widget_activities(adk_event: Any) -> List[Tuple[str, Dict[str, Any]]]:
+    """``(message id, content)`` of the activity for each A2UI widget on an event.
+
+    The id is derived from the widget id, so a re-render of the same widget
+    (e.g. after the user answers it) replaces its activity, and a client
+    restored from session history sees the id the live stream used.
+    """
+    actions = getattr(adk_event, "actions", None)
+    activities: List[Tuple[str, Dict[str, Any]]] = []
+    for widget in getattr(actions, "render_ui_widgets", None) or []:
+        operations = (widget.payload or {}).get(A2UI_OPERATIONS_KEY)
+        if widget.provider != A2UI_WIDGET_PROVIDER or not isinstance(operations, list):
+            continue
+        activities.append(
+            (f"{A2UI_ACTIVITY_TYPE}-{widget.id}", {A2UI_OPERATIONS_KEY: operations})
+        )
+    return activities
 
 
 def _as_mapping(value: Any) -> Optional[Dict[str, Any]]:
@@ -557,7 +584,17 @@ class EventTranslator:
                     # Function responses should be emmitted to frontend so it can render the response as well
                     async for event in self._translate_function_response(function_responses):
                         yield event
-                    
+
+            # A2UI widgets a tool rendered with ``tool_context.render_ui_widget``
+            for message_id, content in a2ui_widget_activities(adk_event):
+                yield ActivitySnapshotEvent(
+                    type=EventType.ACTIVITY_SNAPSHOT,
+                    message_id=message_id,
+                    activity_type=A2UI_ACTIVITY_TYPE,
+                    content=content,
+                    replace=True,
+                )
+
             
             # Handle state changes
             if hasattr(adk_event, 'actions') and adk_event.actions:
@@ -1559,6 +1596,10 @@ def adk_events_to_messages(events: List[ADKEvent]) -> List[Message]:
     as ReasoningMessage objects so the client can render them distinctly instead of
     leaking internal model reasoning into the visible chat history.
 
+    An A2UI widget (``tool_context.render_ui_widget``) becomes an ActivityMessage
+    placed after the messages of the event that first rendered it, with the
+    content of its latest render, as the live stream left it.
+
     Args:
         events: List of ADK events from a session (session.events)
 
@@ -1566,8 +1607,28 @@ def adk_events_to_messages(events: List[ADKEvent]) -> List[Message]:
         List of AG-UI Message objects representing the conversation history
     """
     messages: List[Message] = []
+    activity_index: Dict[str, int] = {}
+    widgets: List[Tuple[str, Dict[str, Any]]] = []
+
+    def place_widgets() -> None:
+        for message_id, content in widgets:
+            activity = ActivityMessage(
+                id=message_id,
+                role="activity",
+                activity_type=A2UI_ACTIVITY_TYPE,
+                content=content,
+            )
+            if message_id in activity_index:
+                messages[activity_index[message_id]] = activity
+            else:
+                activity_index[message_id] = len(messages)
+                messages.append(activity)
 
     for event in events:
+        # The previous event's widgets go after the messages it produced.
+        place_widgets()
+        widgets = a2ui_widget_activities(event)
+
         # Skip events without content
         if not hasattr(event, 'content') or event.content is None:
             continue
@@ -1669,6 +1730,7 @@ def adk_events_to_messages(events: List[ADKEvent]) -> List[Message]:
                 )
                 messages.append(assistant_message)
 
+    place_widgets()
     return messages
 
 
