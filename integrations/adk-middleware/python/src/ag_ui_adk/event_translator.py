@@ -29,7 +29,7 @@ from google.adk.events import Event as ADKEvent
 
 from .config import PredictStateMapping, normalize_predict_state
 from .serialization import serialize_tool_args
-from .session_manager import _is_processed_message_state_key
+from .session_manager import PENDING_CONFIRM_CHANGES_STATE_KEY, _is_processed_message_state_key
 from .utils.converters import _escape_json_pointer_token
 
 import logging
@@ -76,6 +76,46 @@ def confirmation_interrupt(function_call: Any) -> Interrupt:
             }
         },
     )
+
+def open_interrupts(session: Any) -> List[Interrupt]:
+    """The interrupts still awaiting an answer on a session, as RUN_FINISHED reported them.
+
+    An ``adk_request_confirmation`` call is open until a FunctionResponse answers
+    it; open ``confirm_changes`` reviews are kept in session state. Read from the
+    session alone, so every instance, a restarted one included, sees the same set.
+    """
+    events = getattr(session, "events", None) or []
+    state = getattr(session, "state", None) or {}
+    answered = {
+        response.id
+        for event in events
+        for response in event.get_function_responses() or []
+        if response.id
+    }
+    # The client knows a call by the id it was streamed under.
+    client_ids = {
+        adk_id: client_id
+        for client_id, adk_id in (state.get("lro_tool_call_id_remap") or {}).items()
+    }
+    interrupts: List[Interrupt] = []
+    for event in events:
+        for call in event.get_function_calls() or []:
+            if call.name != REQUEST_CONFIRMATION_TOOL_NAME or not call.id or call.id in answered:
+                continue
+            answered.add(call.id)
+            interrupt = confirmation_interrupt(call)
+            client_id = client_ids.get(call.id)
+            if client_id:
+                interrupt = interrupt.model_copy(update={"id": client_id, "tool_call_id": client_id})
+            interrupts.append(interrupt)
+    for review in state.get(PENDING_CONFIRM_CHANGES_STATE_KEY) or []:
+        interrupts.append(
+            Interrupt.model_validate(review) if isinstance(review, dict)
+            # Recorded by id alone before the review was kept whole.
+            else Interrupt(id=review, reason="confirm_changes", tool_call_id=review)
+        )
+    return interrupts
+
 
 # Backwards-compatible thought support detection
 # The part.thought attribute may not exist in older versions of google-genai

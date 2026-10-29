@@ -125,7 +125,7 @@ class TestConfirmChangesAcrossInstances:
         store = InMemorySessionService()
         agent_a, _ = _instance(store)
         _, confirm_id, history = await _propose(agent_a)
-        assert (await _session_state(agent_a))[PENDING_CONFIRM_CHANGES_STATE_KEY] == [confirm_id]
+        assert [r["id"] for r in (await _session_state(agent_a))[PENDING_CONFIRM_CHANGES_STATE_KEY]] == [confirm_id]
 
         agent_b, llm_b = _instance(store, proposes=False)
         turn2 = await collect(agent_b, run_input(THREAD, "run-2", history + [_rejection(confirm_id)]))
@@ -221,7 +221,7 @@ class TestPendingConfirmChangesStateKey:
         store = InMemorySessionService()
         agent, _ = _instance(store)
         events, confirm_id, history = await _propose(agent)
-        assert (await _session_state(agent))[PENDING_CONFIRM_CHANGES_STATE_KEY] == [confirm_id]
+        assert [r["id"] for r in (await _session_state(agent))[PENDING_CONFIRM_CHANGES_STATE_KEY]] == [confirm_id]
         assert _snapshots(events), "the proposal run sends state snapshots"
         turn2 = await collect(agent, run_input(THREAD, "run-2", history + [_rejection(confirm_id)]))
 
