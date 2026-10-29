@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A2UI widgets rendered with ADK's `tool_context.render_ui_widget` reach the
+  client. A `UiWidget` with `provider="a2ui"` and its A2UI messages under
+  `payload["a2ui_operations"]` becomes an `a2ui-surface` activity, the shape the
+  A2UI middleware emits: an `ACTIVITY_SNAPSHOT` (`replace=True`) live, and an
+  `ActivityMessage` in `adk_events_to_messages` (placed after the messages of the
+  event that first rendered it, with its latest content). Both use the id
+  `a2ui-surface-<widget id>`, so a re-render replaces the surface in place.
+  A `MESSAGES_SNAPSHOT` that carries activities declares no activity type its
+  own (`metadata["@ag-ui/client"].authoritativeActivityTypes = []`), so the
+  client keeps activities it holds from elsewhere instead of deleting every one
+  the snapshot leaves out. Other providers are ignored.
+
 - `emit_interrupt_outcome` option on `ADKAgent` and `ADKAgent.from_app()`
   (default `False`). When on, `RUN_FINISHED` carries an interrupt outcome
   (`outcome.type == "interrupt"`) when a run pauses for a human decision: an ADK

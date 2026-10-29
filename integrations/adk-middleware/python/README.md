@@ -26,6 +26,17 @@ remains with `ag-ui-a2ui-toolkit` so client catalogs with unresolved refs still
 work. JSON repair still uses `parse_and_fix`. Unusable catalogs retain the raw
 prompt fallback; SDK rendering failures log a warning before that fallback.
 
+A tool can also draw a fixed A2UI surface itself with ADK's
+`tool_context.render_ui_widget(UiWidget(id=..., provider="a2ui",
+payload={"a2ui_operations": [...]}))`. The widget becomes an `a2ui-surface`
+activity with id `a2ui-surface-<widget id>`: an `ACTIVITY_SNAPSHOT` (`replace`)
+live, and an `ActivityMessage` in `adk_events_to_messages`, so a restored thread
+draws it as the stream did. The widget id is the surface's identity: rendering
+the same id again replaces it. A tool should either render the widget or return
+`a2ui_operations` for the A2UI middleware, not both, or the client draws the
+surface twice. `generate_a2ui` updates only surfaces it created, not ones drawn
+with `render_ui_widget`.
+
 AG-UI needs neither the separate `a2ui-adk` integration nor `a2ui-a2a` and adds
 no A2A version constraint. Applications that use Google's `a2ui.adk` tools
 directly must separately install `a2ui-adk` and follow its requirements.
