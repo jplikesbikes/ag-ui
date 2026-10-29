@@ -227,6 +227,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now includes `pending_tool_calls`) and what the client is not shown. The
   run's context (`_ag_ui_context`) stays visible: it is the client's own input
   (#964).
+- A client restored from a messages snapshot (`/agents/state`,
+  `emit_messages_snapshot`, or `adk_events_to_messages`) no longer re-runs the
+  thread's history. What the session already holds now counts as processed on
+  every replica: the ids `adk_events_to_messages` gives its events, and each
+  tool result's `tool_call_id`. Tool results in a snapshot get stable ids
+  (`{event_id}-tool-{n}`) instead of a fresh uuid on every read.
+- A user message in a snapshot keeps the id the client sent. The middleware
+  records it on the ADK user event (`custom_metadata["_ag_ui_message_id"]`, as
+  the JS integration does), both for the run's message and for seeded history,
+  so a restored client and a live one agree on ids. ADK 2.2 and 2.3 do not apply
+  run metadata to the user event; there the snapshot keeps the event's id, which
+  still counts as processed.
+- `google-adk` 2.0.x and 2.1.x are excluded. Their `Runner` writes the run's
+  user event without the run's `state_delta` (restored in 2.2.0), so the
+  processed-message ledger never persisted and a replica that had not served
+  the thread re-answered messages that were already answered.
 - A client tool result now resumes the agent on ADK 2.12 when the client's
   history does not include the assistant message with the tool call (#3103).
   The `FunctionResponse` was named `"unknown"`, and ADK 2.12 re-dispatches a
