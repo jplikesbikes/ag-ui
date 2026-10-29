@@ -227,6 +227,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now includes `pending_tool_calls`) and what the client is not shown. The
   run's context (`_ag_ui_context`) stays visible: it is the client's own input
   (#964).
+- A run that answers a tool confirmation and carries a new user message
+  re-runs the confirmed tool. The confirmation's FunctionResponse and the
+  message went to ADK in one invocation, which made the message the last user
+  event, so ADK's confirmation processor (which reads the last user event,
+  #1839) never handed the tool its decision. Results that must be the last user
+  event of their invocation (a confirmation answer, any result to a `Workflow`
+  root, #1669) now run on their own and the run's messages after them, inside
+  the same AG-UI run. If they pause the run again, the messages wait and follow
+  the answer to that pause. The split happens after the multi-call gates, so a
+  message sent while another call of the turn is unanswered still ends the run
+  with `PENDING_TOOL_CALLS`. Results to other tools still share one model turn
+  with the message.
+- A confirmation answered together with another tool's result no longer drops
+  that result from the model's context. ADK leaves any event holding a
+  confirmation out of the model's context, and both went in one event; the
+  other results now go in an event of their own, before the confirmation's.
+- Every new user message of a run reaches the model. Only the latest was sent,
+  and the rest were marked processed. Until the session holds one of the
+  client's messages (a new thread, or a native ADK session), the latest is
+  still the only input (#2865).
 - A client restored from a messages snapshot (`/agents/state`,
   `emit_messages_snapshot`, or `adk_events_to_messages`) no longer re-runs the
   thread's history. What the session already holds now counts as processed on
