@@ -83,21 +83,9 @@ from .session_manager import (
     SessionManager, CONTEXT_STATE_KEY, INVOCATION_ID_STATE_KEY,
     PENDING_CONFIRM_CHANGES_STATE_KEY,
     THREAD_ID_STATE_KEY, APP_NAME_STATE_KEY, USER_ID_STATE_KEY,
-    _is_processed_message_state_key,
+    INTERNAL_STATE_KEYS as _INTERNAL_STATE_KEYS,
+    _is_internal_state_key,
 )
-
-# Session-state keys managed exclusively by the backend.  These must never be
-# overwritten by stale ``input.state`` values sent back from the frontend,
-# otherwise internal metadata (e.g. LRO ID remaps) is lost between requests.
-_INTERNAL_STATE_KEYS = frozenset({
-    "lro_tool_call_id_remap",
-    CONTEXT_STATE_KEY,
-    THREAD_ID_STATE_KEY,
-    APP_NAME_STATE_KEY,
-    USER_ID_STATE_KEY,
-    INVOCATION_ID_STATE_KEY,
-    PENDING_CONFIRM_CHANGES_STATE_KEY,
-})
 
 # ADK routes state keys carrying these prefixes to app-wide and user-wide
 # scope instead of to the session.
@@ -3847,8 +3835,7 @@ class ADKAgent:
             # See: https://github.com/ag-ui-protocol/ag-ui/issues/1168
             state_with_context = {
                 key: value for key, value in state_with_context.items()
-                if key not in _INTERNAL_STATE_KEYS
-                and not _is_processed_message_state_key(key)
+                if not _is_internal_state_key(key)
             }
 
             # Split `temp:`-prefixed keys from the persisted state. Every stock

@@ -217,6 +217,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Backend bookkeeping in session state no longer reaches the client.
+  `STATE_SNAPSHOT`, `STATE_DELTA` and `/agents/state` sent `pending_tool_calls`,
+  `lro_tool_call_id_remap`, the invocation id, the pending `confirm_changes`
+  ids and the thread/app/user stamps as application state. Clients echo back
+  the state they are shown, so an answered call came back in
+  `pending_tool_calls` and stayed pending for the life of the thread. One
+  predicate now decides both what a run's `input.state` may not write (which
+  now includes `pending_tool_calls`) and what the client is not shown. The
+  run's context (`_ag_ui_context`) stays visible: it is the client's own input
+  (#964).
 - A client tool result now resumes the agent on ADK 2.12 when the client's
   history does not include the assistant message with the tool call (#3103).
   The `FunctionResponse` was named `"unknown"`, and ADK 2.12 re-dispatches a
