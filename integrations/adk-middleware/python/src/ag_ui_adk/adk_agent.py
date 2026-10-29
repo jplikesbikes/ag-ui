@@ -76,6 +76,8 @@ from google.genai import types
 from .event_translator import (
     EventTranslator,
     adk_events_to_messages,
+    session_history_message_ids,
+    AG_UI_MESSAGE_ID_METADATA_KEY,
     CONFIRM_CHANGES_TOOL_NAME,
     REQUEST_CONFIRMATION_TOOL_NAME,
 )
@@ -2353,6 +2355,7 @@ class ADKAgent:
                 invocation_id=invocation_id,
                 author=event_author,
                 content=types.Content(role=content_role, parts=parts),
+                custom_metadata={AG_UI_MESSAGE_ID_METADATA_KEY: message.id},
             ))
         end = time.time() if now is None else now
         for i, event in enumerate(events):
@@ -2390,6 +2393,24 @@ class ADKAgent:
             self._session_manager.mark_messages_processed(
                 app_name, input.thread_id, message_ids, user_id=user_id
             )
+
+    @staticmethod
+    def _latest_user_message_id(messages: Optional[List[Any]]) -> Optional[str]:
+        """The id of the message ``_convert_latest_message`` converts."""
+        for message in reversed(messages or []):
+            if getattr(message, "role", None) == "user" and getattr(message, "content", None):
+                return getattr(message, "id", None)
+        return None
+
+    @staticmethod
+    def _with_message_id(run_config: Any, message_id: Optional[str]) -> Any:
+        """Record the run's message id on the user event ADK writes for it."""
+        if not message_id or not hasattr(run_config, "custom_metadata"):
+            return run_config
+        return run_config.model_copy(update={"custom_metadata": {
+            **(run_config.custom_metadata or {}),
+            AG_UI_MESSAGE_ID_METADATA_KEY: message_id,
+        }})
 
     async def _convert_latest_message(
         self,
@@ -2460,17 +2481,32 @@ class ADKAgent:
         backend_session_id = await self._known_backend_session_id(
             app_name, session_id, user_id
         )
+        # A client restored from a messages snapshot re-sends the session's own
+        # history under the snapshot's IDs, which no ledger holds, on any
+        # replica. What the session already contains has been processed, so
+        # those IDs count too. They are derived on each read and never marked,
+        # so restoring does not grow the ledger.
+        history_ids: Set[str] = set()
         if backend_session_id:
+            # One backend read serves both the ledger and the history.
+            cache_token = self._session_manager.start_session_read_cache()
             try:
                 await self._session_manager.hydrate_processed_message_ids(
                     app_name, session_id, backend_session_id, user_id=user_id
                 )
+                session = await self._session_manager.get_session(
+                    backend_session_id, app_name, user_id, raise_on_error=True
+                )
             except Exception as exc:
                 _log_session_lookup_failure(session_id, app_name, user_id)
                 raise _SessionLookupError from exc
+            finally:
+                self._session_manager.stop_session_read_cache(cache_token)
+            if session is not None:
+                history_ids = session_history_message_ids(session.events)
         processed_ids = self._session_manager.get_processed_message_ids(
             app_name, session_id, user_id=user_id
-        )
+        ) | history_ids
 
         # Filter out all processed messages, maintaining chronological order
         unseen: List[Any] = []
@@ -3971,6 +4007,7 @@ class ADKAgent:
             # The original code had a bug: `if message_batch else None` would skip conversion when
             # message_batch was None but unseen_messages contained valid user messages
             user_message = await self._convert_latest_message(input, unseen_messages)
+            user_message_id = self._latest_user_message_id(unseen_messages)
 
             # Track invocation_id for tool-only submissions (when new_message will be None)
             tool_only_invocation_id: Optional[str] = None
@@ -4154,6 +4191,7 @@ class ADKAgent:
                 # already processed), fall back to extracting the latest user message from input.messages
                 if user_message is None and input.messages:
                     user_message = await self._convert_latest_message(input, input.messages)
+                    user_message_id = self._latest_user_message_id(input.messages)
                 new_message = user_message
 
             # Create a single shared set for tracking tool call IDs emitted by ClientProxyTool.
@@ -4254,7 +4292,11 @@ class ADKAgent:
                 "user_id": user_id,
                 "session_id": backend_session_id,  # Use backend session_id, not thread_id
                 "new_message": new_message,
-                "run_config": run_config
+                "run_config": (
+                    self._with_message_id(run_config, user_message_id)
+                    if new_message is not None and new_message is user_message
+                    else run_config
+                ),
             }
 
             # Conditionally pass invocation_id based on root agent type and scenario.
