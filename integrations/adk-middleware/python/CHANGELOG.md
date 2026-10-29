@@ -217,6 +217,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A run that answers an ADK tool confirmation and carries a new user message
+  re-runs the confirmed tool. The confirmation's FunctionResponse and the
+  message went to ADK in one invocation, which made the message the last user
+  event, so ADK's confirmation processor (which reads the last user event,
+  #1839) never handed the tool its decision. The confirmation now runs first and
+  the message after it, inside the same AG-UI run.
+
 - An answered tool call no longer stays in `pending_tool_calls`. Clients echo
   back the state they were given, and that echo was written after the answer
   removed the call, putting it back; every answered call then stayed pending

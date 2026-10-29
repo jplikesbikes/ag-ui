@@ -1831,6 +1831,16 @@ class ADKAgent:
                             user_id=user_id,
                         )
 
+                # ADK re-runs a confirmed tool only while the confirmation's
+                # FunctionResponse is the last user event (ag-ui#1839). Sent in
+                # one invocation with a new message, the message is last and the
+                # tool never sees its decision, so run the message after it.
+                deferred_messages: List[Any] = []
+                if trailing_messages and await self._answers_request_confirmation(
+                    input, user_id, tool_call_ids, app_name=app_name
+                ):
+                    deferred_messages, trailing_messages = trailing_messages, []
+
                 async with aclosing(
                     self._handle_tool_result_submission(
                         input,
@@ -1843,6 +1853,13 @@ class ADKAgent:
                         emitted_any = True
                         yield event
                 skip_tool_message_batch = False
+
+                if deferred_messages:
+                    async with aclosing(
+                        self._start_new_execution(input, message_batch=deferred_messages)
+                    ) as batch_events:
+                        async for event in batch_events:
+                            yield event
             else:
                 message_batch: List[Any] = []
                 assistant_message_ids: List[str] = []
@@ -2162,6 +2179,28 @@ class ADKAgent:
             new_messages.extend(inserts.get(i, []))
         new_messages.extend(trailing)
         return input.model_copy(update={"messages": new_messages})
+
+    async def _answers_request_confirmation(
+        self,
+        input: RunAgentInput,
+        user_id: str,
+        tool_call_ids: List[str],
+        *,
+        app_name: str,
+    ) -> bool:
+        """Whether any of these results answers an ``adk_request_confirmation`` call."""
+        names = {
+            call.id: call.function.name
+            for message in input.messages or []
+            for call in getattr(message, "tool_calls", None) or []
+        }
+        for call_id in tool_call_ids:
+            name = names.get(call_id) or await self._find_pending_call_name(
+                input, user_id, call_id, app_name=app_name
+            )
+            if name == REQUEST_CONFIRMATION_TOOL_NAME:
+                return True
+        return False
 
     async def _find_pending_call_name(
         self, input: RunAgentInput, user_id: str, call_id: str, *, app_name: str
