@@ -172,7 +172,7 @@ async def test_mixed_rejection_is_consumed_once_without_replaying_history(
         session = await service.get_session(
             app_name=APP, user_id=USER, session_id=THREAD
         )
-        assert session.state[PENDING_CONFIRM_CHANGES_STATE_KEY] == [
+        assert [r["id"] for r in session.state[PENDING_CONFIRM_CHANGES_STATE_KEY]] == [
             open_confirm
         ]
         assert session.state["pending_tool_calls"] == [pending_call]
