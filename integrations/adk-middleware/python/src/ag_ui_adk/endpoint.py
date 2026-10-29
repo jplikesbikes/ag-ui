@@ -36,7 +36,7 @@ from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from .adk_agent import ADKAgent
 from .event_translator import adk_events_to_messages
-from .session_manager import _is_processed_message_state_key
+from .session_manager import _is_hidden_state_key
 
 logger = logging.getLogger(__name__)
 
@@ -688,7 +688,7 @@ def add_adk_fastapi_endpoint(
                 "threadExists": thread_exists,
                 "state": {
                     key: value for key, value in state.items()
-                    if not _is_processed_message_state_key(key)
+                    if not _is_hidden_state_key(key)
                 },
                 "messages": messages_dict
             })
