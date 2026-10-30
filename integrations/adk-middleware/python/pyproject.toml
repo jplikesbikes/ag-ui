@@ -50,7 +50,10 @@ dependencies = [
     # absent, so the whole [1.28.1, 3.0) range is genuinely supported. The lock pins
     # 1.35.0 only as the dev/CI resolution — the version where the full suite runs
     # unskipped — NOT a declared cap.
-    "google-adk>=1.28.1,<3.0.0",
+    # 2.0.x and 2.1.x are excluded: their Runner writes the run's user event
+    # without the run's state_delta (restored in 2.2.0), so the processed-message
+    # ledger never persists and a replica re-answers messages already answered.
+    "google-adk>=1.28.1,!=2.0.*,!=2.1.*,<3.0.0",
     "pydantic>=2.11.7",
     # Primary SSE response implementation. Used unconditionally so the FastAPI
     # floor stays at >=0.115.2 (rather than the >=0.135.0 jump that would be
@@ -90,7 +93,7 @@ dev = [
     "pytest-cov>=6.2.1",
     "pytest-xdist>=3.8.0",
     # Database fixtures need ADK's optional database dependencies on 2.x.
-    "google-adk[db]>=1.28.1,<3.0.0",
+    "google-adk[db]>=1.28.1,!=2.0.*,!=2.1.*,<3.0.0",
     # SQLAlchemy's async engine (used by ADK's ``DatabaseSessionService`` in
     # several test fixtures) requires greenlet. ``google-adk[db]`` 2.0 pulls
     # aiosqlite but not greenlet, so we declare it explicitly here.
