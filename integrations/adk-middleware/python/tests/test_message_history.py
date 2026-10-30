@@ -1039,6 +1039,13 @@ class TestEmitMessagesSnapshot:
 # Integration Tests: /agents/state endpoint
 # ============================================================================
 
+def _with_real_identity(agent):
+    """Give a mocked ADKAgent the real identity resolvers a run uses."""
+    for name in ("_get_app_name", "_get_user_id", "_default_app_extractor", "_default_user_extractor"):
+        setattr(agent, name, getattr(ADKAgent, name).__get__(agent))
+    return agent
+
+
 class TestAgentsStateEndpoint:
     """Integration tests for the /agents/state endpoint."""
 
@@ -1057,7 +1064,7 @@ class TestAgentsStateEndpoint:
         mock_session_manager = MagicMock()
         agent._session_manager = mock_session_manager
 
-        return agent
+        return _with_real_identity(agent)
 
     @pytest.fixture(
         params=[FastAPI, APIRouter]
@@ -1492,9 +1499,11 @@ class TestAgentsStateExtractorIntegration:
     user's session state and message history by supplying any ``userId`` in
     the body.
 
-    These tests pin the fix: the extractor is invoked on /agents/state, its
-    output drives identity resolution, and the body fields fall back only
-    when no other source produces a value.
+    These tests pin the fix: the extractor is invoked on /agents/state, and
+    the thread's identity is resolved exactly as a run resolves it, so the
+    body fields are never identity. A JWT deployment exposes the identity its
+    extractor writes to state through the agent's own extractors, which is
+    what makes a run use it too.
     """
 
     @pytest.fixture
@@ -1518,7 +1527,13 @@ class TestAgentsStateExtractorIntegration:
         agent._session_manager = MagicMock()
         agent._session_lookup_cache = {}
 
-        return agent
+        return _with_real_identity(agent)
+
+    @staticmethod
+    def _identity_from_state(mock_agent):
+        """A JWT deployment: the agent reads the identity the extractor wrote."""
+        mock_agent._app_name_extractor = lambda input: input.state["app_name"]
+        mock_agent._user_id_extractor = lambda input: input.state["user_id"]
 
     def _wire_session_lookup(self, mock_agent, expected_app_name, expected_user_id):
         """Wire the session-lookup chain so the endpoint reaches a 200 response
@@ -1559,6 +1574,7 @@ class TestAgentsStateExtractorIntegration:
     def test_extract_state_fn_is_invoked(self, mock_agent):
         """Regression: /agents/state must call extract_state_from_request."""
         self._wire_session_lookup(mock_agent, "extractor-app", "extractor-user")
+        self._identity_from_state(mock_agent)
 
         extract_state_fn = AsyncMock(
             return_value={"app_name": "extractor-app", "user_id": "extractor-user"}
@@ -1591,6 +1607,7 @@ class TestAgentsStateExtractorIntegration:
         the spoofed value never reaches ``_session_manager``.
         """
         self._wire_session_lookup(mock_agent, "from-jwt-app", "from-jwt-user")
+        self._identity_from_state(mock_agent)
 
         async def jwt_extractor(request, input_data):
             return {"app_name": "from-jwt-app", "user_id": "from-jwt-user"}
@@ -1628,6 +1645,7 @@ class TestAgentsStateExtractorIntegration:
         falls through to the cold lookup this test forbids.
         """
         self._wire_session_lookup(mock_agent, "from-jwt-app", "from-jwt-user")
+        self._identity_from_state(mock_agent)
         # The fast path reloads the cached session directly from the backend.
         cached_session = MagicMock(id="backend-session-id", events=[])
         mock_agent._session_manager._session_service.get_session = AsyncMock(
@@ -1681,35 +1699,36 @@ class TestAgentsStateExtractorIntegration:
             raise_on_error=True,
         )
 
-    def test_body_fallback_when_no_extractor(self, mock_agent):
-        """Backward compat: body userId still works when no extractor is set."""
-        self._wire_session_lookup(mock_agent, "body-app", "body-user")
+    def test_body_identity_is_ignored_without_an_extractor(self, mock_agent):
+        """With no identity configured, a run uses the agent's defaults (its
+        name, ``thread_user_<thread>``); the state read uses them too, not the
+        body's, which a client could set to another app's or user's."""
+        self._wire_session_lookup(mock_agent, "test_agent", "thread_user_thread-3")
 
         app = FastAPI()
         add_adk_fastapi_endpoint(app, mock_agent, path="/")
 
         with TestClient(app) as client:
-            response = client.post(
-                "/agents/state",
-                json={
-                    "threadId": "thread-3",
-                    "userId": "body-user",
-                    "appName": "body-app",
-                },
-            )
+            with pytest.warns(DeprecationWarning, match="#1646"):
+                response = client.post(
+                    "/agents/state",
+                    json={
+                        "threadId": "thread-3",
+                        "userId": "body-user",
+                        "appName": "body-app",
+                    },
+                )
 
         assert response.status_code == 200
         find_call = mock_agent._session_manager.resolve_existing_session.call_args
-        assert find_call.kwargs["user_id"] == "body-user"
-        assert find_call.kwargs["app_name"] == "body-app"
-        self._assert_scoped_to(mock_agent, "thread-3", "body-app", "body-user")
+        assert "body" not in str(find_call)
+        self._assert_scoped_to(mock_agent, "thread-3", "test_agent", "thread_user_thread-3")
 
     def test_extract_headers_does_not_auto_protect_identity(self, mock_agent):
         """Documentation test: legacy ``extract_headers`` parks values under
-        ``state.headers.*`` and so does NOT override identity. Deployments
-        wanting auth must either (a) write a custom ``extract_state_from_request``
-        that places the value at ``state["user_id"]``, or (b) configure an
-        ADKAgent-level ``user_id_extractor`` that reads ``input.state.headers``.
+        ``state.headers.*`` and so does NOT set identity. Deployments wanting
+        auth configure an ADKAgent-level ``user_id_extractor`` that reads the
+        value from ``input.state``, which a run applies too.
         Pinned here so a future refactor doesn't silently change this contract.
         """
         from ag_ui_adk.endpoint import make_extract_headers
@@ -1737,12 +1756,11 @@ class TestAgentsStateExtractorIntegration:
                 )
 
         assert response.status_code == 200
-        # extract_headers writes to state.headers.user_id, not state.user_id, so
-        # identity falls through to the body fallback for both fields.
+        # extract_headers writes to state.headers.user_id, which no agent-level
+        # extractor reads here, so identity is the run's default, never the body.
         find_call = mock_agent._session_manager.resolve_existing_session.call_args
-        assert find_call.kwargs["user_id"] == "body-user"
-        assert find_call.kwargs["app_name"] == "body-app"
-        self._assert_scoped_to(mock_agent, "thread-4", "body-app", "body-user")
+        assert "body" not in str(find_call)
+        self._assert_scoped_to(mock_agent, "thread-4", "test_agent", "thread_user_thread-4")
 
 
 # ============================================================================

@@ -299,17 +299,16 @@ class AgentStateRequest(BaseModel):
 
     EXPERIMENTAL: This endpoint is subject to change in future versions.
 
-    ``appName`` and ``userId`` are **deprecated** as primary identity inputs
-    (ag-ui-protocol/ag-ui#1646). When ``extract_state_from_request`` is
-    configured on the endpoint, identity is resolved from the extractor
-    pipeline (matching the chat endpoint) and these body fields are ignored
-    — a ``DeprecationWarning`` is emitted to surface the mismatch. They
-    remain as a fallback only when no static value and no extractor produce
-    an identity.
+    ``appName`` and ``userId`` are **deprecated** and ignored
+    (ag-ui-protocol/ag-ui#1646): the thread's identity is resolved as a run
+    resolves it, through ``extract_state_from_request`` and the agent's
+    ``_get_app_name`` / ``_get_user_id``. A client naming another app or user
+    would otherwise read that thread. Sending them emits a
+    ``DeprecationWarning``.
     """
     threadId: str
-    appName: Optional[str] = None  # Deprecated fallback — see class docstring
-    userId: Optional[str] = None   # Deprecated fallback — see class docstring
+    appName: Optional[str] = None  # Deprecated, ignored — see class docstring
+    userId: Optional[str] = None   # Deprecated, ignored — see class docstring
     name: Optional[str] = None
     properties: Optional[Any] = None
 
@@ -536,14 +535,13 @@ def add_adk_fastapi_endpoint(
         future versions. It is provided to support front-end frameworks that
         require on-demand access to thread state.
 
-        Identity resolution mirrors the chat endpoint so that
-        ``extract_state_from_request`` (and the legacy ``extract_headers``)
-        is not bypassed when used as an auth hook (#1646). A synthetic
-        ``RunAgentInput`` is constructed from the request body and threaded
-        through the same extractor pipeline; the resulting state is then
-        consulted for ``app_name``/``user_id`` alongside the agent-level
-        static values and extractors. Body ``appName``/``userId`` are kept
-        as a documented fallback for deployments that configure neither.
+        The thread's app and user are resolved exactly as a run resolves them:
+        a synthetic ``RunAgentInput`` goes through the same
+        ``extract_state_from_request`` pipeline (#1646), then the agent's own
+        ``_get_app_name`` / ``_get_user_id``, so a subclass override, a static
+        value, an extractor and the defaults all apply. The request body's
+        ``appName`` / ``userId`` are not identity: a client could otherwise
+        name another app's or user's thread and read it.
 
         Args:
             request_data: Request containing threadId and optional name/properties
@@ -574,41 +572,16 @@ def add_adk_fastapi_endpoint(
                 default_agent, request, synthetic_input, agent_resolver
             )
 
-            extractor_state = (
-                synthetic_input.state if isinstance(synthetic_input.state, dict) else {}
-            )
+            # The session a run would use: whatever this request's identity
+            # resolves to through the agent, never a client-chosen one.
+            app_name = agent._get_app_name(synthetic_input)
+            user_id = agent._get_user_id(synthetic_input)
 
-            # Identity precedence (matches chat endpoint, then falls back to body):
-            #   1. ADKAgent static value
-            #   2. ADKAgent-level extractor against post-extractor state
-            #   3. state["app_name"] / state["user_id"] written by extract_state_fn
-            #      (so JWT-style hooks work without also wiring an ADKAgent extractor)
-            #   4. Body field (deprecated when an extractor is configured)
-            if agent._static_app_name:
-                app_name = agent._static_app_name
-            elif getattr(agent, "_app_name_extractor", None):
-                app_name = agent._app_name_extractor(synthetic_input)
-            elif "app_name" in extractor_state:
-                app_name = extractor_state["app_name"]
-            else:
-                app_name = request_data.appName
-
-            if agent._static_user_id:
-                user_id = agent._static_user_id
-            elif getattr(agent, "_user_id_extractor", None):
-                user_id = agent._user_id_extractor(synthetic_input)
-            elif "user_id" in extractor_state:
-                user_id = extractor_state["user_id"]
-            else:
-                user_id = request_data.userId
-
-            if extract_state_fn and (request_data.appName or request_data.userId):
+            if request_data.appName or request_data.userId:
                 warnings.warn(
                     "appName/userId in the /agents/state request body are "
-                    "deprecated when extract_state_from_request is configured. "
-                    "Identity is resolved from the extractor pipeline; body "
-                    "values are ignored unless the extractor produces neither. "
-                    "See ag-ui-protocol/ag-ui#1646.",
+                    "ignored: the thread's identity is resolved as a run "
+                    "resolves it. See ag-ui-protocol/ag-ui#1646.",
                     DeprecationWarning,
                     stacklevel=2,
                 )
@@ -619,7 +592,7 @@ def add_adk_fastapi_endpoint(
                     "threadExists": False,
                     "state": "{}",
                     "messages": "[]",
-                    "error": "appName and userId are required (either in request or as agent static values)"
+                    "error": "The agent resolved no app name or user id for this thread."
                 })
 
             session = None
