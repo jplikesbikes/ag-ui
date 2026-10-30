@@ -37,6 +37,16 @@ the same id again replaces it. A tool should either render the widget or return
 surface twice. `generate_a2ui` updates only surfaces it created, not ones drawn
 with `render_ui_widget`.
 
+This follows the convention of AG-UI's A2UI middleware
+(`middlewares/a2ui-middleware`): one activity per surface, and each snapshot is
+the whole surface, `createSurface` included, so any one snapshot can draw it.
+The A2UI renderer ignores `createSurface` for a surface it already has. A2UI's
+own spec treats a repeated `createSurface` as an error, so a bridge that
+forwards these snapshots to a strict A2UI consumer (for example over A2A) must
+drop the repeat or send only what changed. The widget is stored on the ADK
+event, so history and A2A see the same surface; the `a2ui_operations` route
+renders from the tool result instead.
+
 AG-UI needs neither the separate `a2ui-adk` integration nor `a2ui-a2a` and adds
 no A2A version constraint. Applications that use Google's `a2ui.adk` tools
 directly must separately install `a2ui-adk` and follow its requirements.
