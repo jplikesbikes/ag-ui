@@ -690,6 +690,12 @@ The `appName` and `userId` parameters are optional if the `ADKAgent` was configu
 
 Note: The `state` and `messages` fields are JSON-stringified for compatibility with front-end frameworks that expect this format.
 
+With `emit_interrupt_outcome=True`, the response also has `interrupts`: the
+thread's open interrupts, as the closing `RUN_FINISHED` reported them, read from
+the session on any instance. A client restoring an interrupted thread answers
+them with `RunAgentInput.resume`. The list is empty when none are open, and the
+field is absent when the agent does not report interrupts.
+
 **Error response:**
 
 When the session backend fails to look up the thread or read its state, the
