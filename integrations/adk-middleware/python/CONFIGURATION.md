@@ -194,6 +194,41 @@ This enables passing frontend context (user preferences, selected items, UI stat
 
 Set `seed_first_run_history=False` to start a new session from the latest user message only.
 
+#### Retrying a Failed Run
+
+A client retries a failed run by running again with the history it already
+sent. With nothing new to process, that run ends in an empty `RUN_STARTED` /
+`RUN_FINISHED`. Set `resume_failed_invocations=True` (on `ADKAgent` or
+`ADKAgent.from_app()`) to resume the thread's latest invocation instead,
+when it failed:
+
+```python
+agent = ADKAgent.from_app(
+    app,  # App(..., resumability_config=ResumabilityConfig(is_resumable=True))
+    user_id="demo_user",
+    resume_failed_invocations=True,
+)
+```
+
+"Failed" is the `failed` state of `/agents/state`'s `runStatus` (see
+[USAGE.md](USAGE.md#experimental-agentsstate-endpoint)): a tool or the model
+raised, the model returned an error response, or the process died mid-turn.
+ADK continues the invocation with `Runner.run_async(invocation_id=...,
+new_message=None)`, and the run streams the rest of the turn:
+
+- a call left without a response by a dead process is executed again;
+- a call whose tool raised (recorded by ADK 2.x) is first closed as aborted, in
+  ADK's abort-seal shape, so the model sees that it failed and the tool is not
+  re-run (ADK 1.x records no raise, so there the call is executed again);
+- otherwise the model is called again. ADK 1.x does not re-run an agent it
+  already closed, so there a model error response is not retried.
+
+Delivery is **at least once**: a tool that was running when the process died
+runs again, so a tool with side effects must tolerate a repeat. A completed,
+canceled, paused (`input-required`) or running invocation is never resumed;
+resuming a completed one would repeat its turn. The option needs an ADK
+resumable app and is ignored without one. It is off by default.
+
 ## Service Configuration
 
 The middleware supports both in-memory (development) and persistent (production) services:
