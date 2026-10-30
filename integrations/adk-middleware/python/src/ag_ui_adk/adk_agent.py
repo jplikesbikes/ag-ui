@@ -79,6 +79,7 @@ from .event_translator import (
     open_interrupts,
     session_history_message_ids,
     AG_UI_MESSAGE_ID_METADATA_KEY,
+    messages_snapshot_event,
     CONFIRM_CHANGES_TOOL_NAME,
     REQUEST_CONFIRMATION_TOOL_NAME,
 )
@@ -2480,9 +2481,7 @@ class ADKAgent:
             return None
         session = await self._session_manager.get_session(backend_session_id, app_name, user_id)
         history = adk_events_to_messages(session.events) if session is not None else []
-        return MessagesSnapshotEvent(
-            type=EventType.MESSAGES_SNAPSHOT, messages=[*history, *waiting]
-        )
+        return messages_snapshot_event([*history, *waiting])
 
     @staticmethod
     def _latest_user_message_id(messages: Optional[List[Any]]) -> Optional[str]:
@@ -4822,11 +4821,7 @@ class ADKAgent:
                     if session and hasattr(session, 'events') and session.events:
                         messages = adk_events_to_messages(session.events)
                         if messages:
-                            messages_snapshot_event = MessagesSnapshotEvent(
-                                type=EventType.MESSAGES_SNAPSHOT,
-                                messages=messages
-                            )
-                            await event_queue.put(messages_snapshot_event)
+                            await event_queue.put(messages_snapshot_event(messages))
                             logger.debug(f"Emitted MESSAGES_SNAPSHOT with {len(messages)} messages for thread {input.thread_id}")
                 except Exception as snapshot_error:
                     logger.warning(f"Failed to emit MESSAGES_SNAPSHOT for thread {input.thread_id}: {snapshot_error}")
