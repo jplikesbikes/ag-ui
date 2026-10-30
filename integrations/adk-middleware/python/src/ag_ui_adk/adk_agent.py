@@ -961,6 +961,18 @@ class ADKAgent:
             return None
         return copy.deepcopy(self._capabilities)
 
+    def _has_live_execution(self, thread_id: str, user_id: str, *, app_name: str) -> bool:
+        """Whether this instance is running an execution for the thread right now.
+
+        An execution kept only because its run paused on a pending tool call
+        is complete, not live. Executions on other instances are not visible.
+        """
+        execution = self._active_executions.get((thread_id, user_id, app_name))
+        if execution is None or execution.is_complete:
+            return False
+        task = getattr(execution, "task", None)
+        return task is None or not task.done()
+
     def _get_session_metadata(self, thread_id: str, user_id: str, *, app_name: str) -> Optional[Tuple[str, str, str]]:
         """Get session metadata within an explicit app/user scope.
 

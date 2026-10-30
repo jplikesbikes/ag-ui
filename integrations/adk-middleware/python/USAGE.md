@@ -684,11 +684,37 @@ The `appName` and `userId` parameters are optional if the `ADKAgent` was configu
   "threadId": "thread_123",
   "threadExists": true,
   "state": "{\"key\": \"value\"}",
-  "messages": "[{\"id\": \"1\", \"role\": \"user\", \"content\": \"Hello\"}]"
+  "messages": "[{\"id\": \"1\", \"role\": \"user\", \"content\": \"Hello\"}]",
+  "runStatus": {"state": "completed"}
 }
 ```
 
 Note: The `state` and `messages` fields are JSON-stringified for compatibility with front-end frameworks that expect this format.
+
+**Run status:** the response also carries `runStatus`, how the thread's latest
+run ended, so a client restoring the thread can tell a finished turn from one
+that failed or was interrupted. It is absent when the thread has no run yet,
+otherwise `{"state": ..., "code": ...}` (`code` only when there is one).
+`state` uses A2A's task states:
+
+| `state` | When | `code` |
+| --- | --- | --- |
+| `working` | an execution of the thread is running on this instance | |
+| `input-required` | a long-running call (a client tool, an ADK tool confirmation) or a predictive-state review waits for its answer | |
+| `completed` | ADK recorded the invocation as finished | `EMPTY_REPLY` when the agent said nothing |
+| `failed` | the invocation ended on an ADK error response (an `error_code` without content), even one followed by `end_of_agent` | the ADK `error_code`, e.g. `SAFETY`, `MALFORMED_FUNCTION_CALL`, or on ADK 2.x the class of the exception a tool or model raised |
+| `failed` | a tool call has no response (the process died mid-tool; on ADK 1.x also a tool that raised) | `INTERRUPTED_IN_TOOL` |
+| `failed` | the invocation stopped without completing (the process died) | `INTERRUPTED` |
+| `canceled` | ADK sealed the invocation as aborted | `INVOCATION_ABORTED` |
+
+The status is derived from the session's events alone; nothing extra is
+stored. ADK writes the `end_of_agent` markers that record completion only for
+a resumable app (`ADKAgent.from_app()` with
+`ResumabilityConfig(is_resumable=True)`); without them a run counts as
+completed when its last event is an agent's final response. ADK's
+`error_message` is never returned, as it can carry provider or exception
+detail. `working` reflects this instance only. The same derivation is
+available as `ag_ui_adk.invocation_outcome(session, live=...)`.
 
 **Error response:**
 
