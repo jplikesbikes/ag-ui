@@ -1664,11 +1664,15 @@ class ADKAgent:
                     )
                 if needs_history:
                     history_seed, unseen_messages = first_run_split
+        # Until the session holds one of the client's messages, nothing tells a
+        # new message from history: a batch's latest user message is its input.
+        first_contact = history_seed is None and len(unseen_messages) == len(input.messages or [])
 
         index = 0
         total_unseen = len(unseen_messages)
         app_name = self._get_app_name(input)
         skip_tool_message_batch = False
+        waiting_user_messages: List[Any] = []
 
         # Check if there are pending tool calls AND tool results in unseen messages
         user_id = self._get_user_id(input)
@@ -1700,14 +1704,30 @@ class ADKAgent:
                     getattr(msg, "role", None) == "tool"
                     and getattr(msg, "tool_call_id", None) in live_result_ids
                 ):
-                    # Mark all messages before the tool result as processed (they're already in the ADK session)
+                    # The results go first. An unseen user message before them
+                    # is not in the session (one sent while the run was paused),
+                    # so it follows them; anything else before them is history.
                     skipped_ids = []
                     for j in range(i):
+                        if getattr(unseen_messages[j], "role", None) == "user":
+                            waiting_user_messages.append(unseen_messages[j])
+                            continue
                         msg_id = getattr(unseen_messages[j], "id", None)
                         if msg_id:
                             skipped_ids.append(msg_id)
                     if skipped_ids:
                         self._session_manager.mark_messages_processed(app_name, input.thread_id, skipped_ids, user_id=user_id)
+                    # The live results are one batch, wherever the client put them.
+                    rest = unseen_messages[i:]
+                    live = [
+                        m for m in rest
+                        if getattr(m, "role", None) == "tool"
+                        and getattr(m, "tool_call_id", None) in live_result_ids
+                    ]
+                    live_ids = {id(m) for m in live}
+                    unseen_messages = unseen_messages[:i] + live + [
+                        m for m in rest if id(m) not in live_ids
+                    ]
                     index = i
                     break
 
@@ -1805,6 +1825,10 @@ class ADKAgent:
 
                     temp_index += 1
 
+                if waiting_user_messages:
+                    trailing_messages = waiting_user_messages + trailing_messages
+                    waiting_user_messages = []
+
                 # If we found trailing messages, advance index and mark assistants as processed
                 if trailing_messages or trailing_assistant_ids:
                     index = temp_index
@@ -1891,6 +1915,11 @@ class ADKAgent:
                     if batch_ids:
                         self._session_manager.mark_messages_processed(app_name, input.thread_id, batch_ids, user_id=user_id)
                     continue
+
+                if first_contact:
+                    message_batch = self._latest_user_message_only(
+                        message_batch, input, user_id, app_name=app_name
+                    )
 
                 logger.debug(f"[RUN_LOOP] Calling _start_new_execution with message_batch of {len(message_batch)} messages")
                 seed_kwargs = {"history_seed": history_seed} if history_seed else {}
@@ -2381,6 +2410,47 @@ class ADKAgent:
             self._session_manager.mark_messages_processed(
                 app_name, input.thread_id, message_ids, user_id=user_id
             )
+
+    def _latest_user_message_only(
+        self, batch: List[Any], input: RunAgentInput, user_id: str, *, app_name: str
+    ) -> List[Any]:
+        """Drop all but the batch's latest user message, recording the rest as seen."""
+        latest_id = self._latest_user_message_id(batch)
+        earlier = [
+            message for message in batch
+            if getattr(message, "role", None) == "user" and getattr(message, "id", None) != latest_id
+        ]
+        dropped_ids = self._collect_message_ids(earlier)
+        if dropped_ids:
+            self._session_manager.mark_messages_processed(
+                app_name, input.thread_id, dropped_ids, user_id=user_id
+            )
+        earlier_ids = {id(message) for message in earlier}
+        return [message for message in batch if id(message) not in earlier_ids]
+
+    def _results_end_their_invocation(self, tool_names: Iterable[Optional[str]]) -> bool:
+        """Whether these results must be the last user event of their own invocation.
+
+        ADK re-runs a confirmed tool only while the confirmation's
+        FunctionResponse is the last user event (#1839), and a Workflow root
+        resumes only from the FunctionResponse in ``new_message`` (#1669).
+        """
+        return self._root_agent_is_workflow() or any(
+            name == REQUEST_CONFIRMATION_TOOL_NAME for name in tool_names
+        )
+
+    async def _messages_snapshot(
+        self, input: RunAgentInput, user_id: str, *, app_name: str, waiting: List[Any]
+    ) -> Optional[MessagesSnapshotEvent]:
+        """The session's history, then the messages still waiting to reach it."""
+        backend_session_id = self._get_backend_session_id(input.thread_id, user_id, app_name=app_name)
+        if not backend_session_id:
+            return None
+        session = await self._session_manager.get_session(backend_session_id, app_name, user_id)
+        history = adk_events_to_messages(session.events) if session is not None else []
+        return MessagesSnapshotEvent(
+            type=EventType.MESSAGES_SNAPSHOT, messages=[*history, *waiting]
+        )
 
     @staticmethod
     def _latest_user_message_id(messages: Optional[List[Any]]) -> Optional[str]:
@@ -2885,12 +2955,33 @@ class ADKAgent:
                         )
                 await consume_confirm_decisions()
 
+            # Results that must end their invocation run alone, and the user's
+            # messages after them, unless the results paused the run again: then
+            # the messages wait, unprocessed, for the run that answers it.
+            follow_up: Optional[List[Any]] = None
+            if not confirm_decisions and any(
+                getattr(message, "role", None) == "user" for message in trailing_messages or []
+            ):
+                result_names = [
+                    result["tool_name"] if result.get("tool_name") not in (None, "unknown")
+                    else await self._find_pending_call_name(
+                        input, user_id, result["message"].tool_call_id, app_name=app_name
+                    )
+                    for result in tool_results
+                ]
+                if self._results_end_their_invocation(result_names):
+                    follow_up, trailing_messages = trailing_messages, None
+                    outstanding_before = set(pending_before) | set(
+                        await self._get_pending_confirm_changes(thread_id, user_id, app_name=app_name)
+                    )
+
             message_batch = trailing_messages if trailing_messages else (candidate_messages if include_message_batch else None)
             if confirm_decisions:
                 message_batch = self._with_confirm_changes_decisions(
                     confirm_decisions, trailing_messages
                 )
 
+            errored = False
             async with aclosing(
                 self._start_new_execution(
                     input,
@@ -2900,7 +2991,28 @@ class ADKAgent:
                 )
             ) as execution_events:
                 async for event in execution_events:
+                    errored = errored or event.type == EventType.RUN_ERROR
                     yield event
+
+            if follow_up and not errored:
+                outstanding_after = set(
+                    await self._get_pending_tool_call_ids(thread_id, user_id, app_name=app_name) or []
+                ) | set(await self._get_pending_confirm_changes(thread_id, user_id, app_name=app_name))
+                if outstanding_after - outstanding_before:
+                    if self._emit_messages_snapshot:
+                        # The snapshot is the client's whole history: keep the
+                        # waiting messages in it, or the client drops them.
+                        snapshot = await self._messages_snapshot(
+                            input, user_id, app_name=app_name, waiting=follow_up
+                        )
+                        if snapshot is not None:
+                            yield snapshot
+                    return
+                async with aclosing(
+                    self._start_new_execution(input, message_batch=follow_up)
+                ) as execution_events:
+                    async for event in execution_events:
+                        yield event
 
         except Exception as e:
             logger.error(f"Error handling tool results: {e}", exc_info=True)
@@ -3995,6 +4107,12 @@ class ADKAgent:
             # message_batch was None but unseen_messages contained valid user messages
             user_message = await self._convert_latest_message(input, unseen_messages)
             user_message_id = self._latest_user_message_id(unseen_messages)
+            earlier_user_messages = [
+                message for message in unseen_messages or []
+                if getattr(message, "role", None) == "user"
+                and getattr(message, "content", None)
+                and getattr(message, "id", None) != user_message_id
+            ]
 
             # Track invocation_id for tool-only submissions (when new_message will be None)
             tool_only_invocation_id: Optional[str] = None
@@ -4067,10 +4185,10 @@ class ADKAgent:
                 # ``end_of_agent`` early-return in _resolve_invocation_id's
                 # resume path that motivated the #1534 workaround for
                 # turn-ending client/frontend tools.
-                is_confirmation_resume = any(
-                    part.function_response is not None
-                    and part.function_response.name == 'adk_request_confirmation'
+                ends_invocation = self._results_end_their_invocation(
+                    part.function_response.name
                     for part in function_response_parts
+                    if part.function_response is not None
                 )
 
                 # ag-ui#1669: the #1534 pre-append workaround is correct for
@@ -4086,8 +4204,7 @@ class ADKAgent:
                 if (
                     _ADK_OVERRIDES_INVOCATION_ID
                     and self._is_adk_resumable()
-                    and not self._root_agent_is_workflow()
-                    and not is_confirmation_resume
+                    and not ends_invocation
                 ):
                     # ADK with _resolve_invocation_id (~1.28+) routing, non-Workflow root:
                     #
@@ -4172,6 +4289,34 @@ class ADKAgent:
                     # FunctionResponse events) by avoiding the pre-append.
                     new_message = function_response_content
                     tool_only_invocation_id = input.run_id
+                    # ADK leaves any event holding a confirmation out of the
+                    # model's context, so the turn's other results go in an
+                    # event of their own, before the confirmation's.
+                    other_parts = [
+                        part for part in function_response_parts
+                        if part.function_response.name != REQUEST_CONFIRMATION_TOOL_NAME
+                    ]
+                    if (
+                        other_parts
+                        and len(other_parts) < len(function_response_parts)
+                        and not self._root_agent_is_workflow()
+                    ):
+                        first_call_id = other_parts[0].function_response.id
+                        await self._session_manager._session_service.append_event(session, Event(
+                            timestamp=time.time(),
+                            author="user",
+                            content=types.Content(role="user", parts=other_parts),
+                            invocation_id=(
+                                self._find_function_call_invocation_id(session, first_call_id)
+                                or stored_invocation_id
+                                or input.run_id
+                            ),
+                        ))
+                        self._session_manager.invalidate_session(backend_session_id, app_name, user_id)
+                        new_message = types.Content(role="user", parts=[
+                            part for part in function_response_parts
+                            if part.function_response.name == REQUEST_CONFIRMATION_TOOL_NAME
+                        ])
             else:
                 # No tool results, just use the user message
                 # If user_message is None (e.g., unseen_messages was empty because all were
@@ -4270,6 +4415,23 @@ class ADKAgent:
                         logger.warning(f"[SESSION_DEBUG] FunctionCall NOT FOUND for id={tool_call_id}! ADK will fail with 'No function call event found'")
             except Exception as e:
                 logger.error(f"[SESSION_DEBUG] Error checking session events: {e}")
+
+            if new_message is not None and new_message is user_message:
+                # Every new user message is input; the latest starts the run and
+                # the earlier ones are written before it, each with its id.
+                for earlier in earlier_user_messages:
+                    parts = convert_message_content_to_parts(earlier.content)
+                    if not parts:
+                        continue
+                    await self._session_manager._session_service.append_event(session, Event(
+                        timestamp=time.time(),
+                        author="user",
+                        invocation_id=input.run_id,
+                        content=types.Content(role="user", parts=parts),
+                        custom_metadata={AG_UI_MESSAGE_ID_METADATA_KEY: earlier.id},
+                    ))
+                if earlier_user_messages:
+                    self._session_manager.invalidate_session(backend_session_id, app_name, user_id)
 
             # Run ADK agent
             is_long_running_tool = False

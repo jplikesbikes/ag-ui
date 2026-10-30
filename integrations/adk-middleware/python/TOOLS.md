@@ -382,6 +382,19 @@ refuses to start the continuation (for example "Maximum concurrent executions
 reached"), the pending call or `confirm_changes` id and the answering message
 stay as they were, so the client can retry the same answer.
 
+A run that answers a tool confirmation and also carries a new user message
+(for example typing instead of answering, sent with a `cancelled` resume)
+delivers the answer first, on its own, so ADK re-runs the tool with its
+decision, and then the message, inside the same AG-UI run. ADK re-runs a
+confirmed tool only while the confirmation is the last user event, and leaves
+any event holding a confirmation out of the model's context, so the two cannot
+share one turn; the turn's other tool results are delivered in an event of
+their own for the same reason. If the re-run tool pauses again (a new
+confirmation, or a call to a frontend tool), the message waits, unprocessed,
+and is delivered after the answer to that pause. When `emit_messages_snapshot`
+is on, the snapshot at that pause ends with the waiting message, so the client
+keeps it. Results to other tools still share one model turn with the message.
+
 ### Enforcement with `emit_interrupt_outcome=True`
 
 With the flag on, the middleware enforces the interrupt contract's rules 3 and
