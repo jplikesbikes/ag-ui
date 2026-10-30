@@ -87,6 +87,10 @@ def resolve_agent_from_message_history(
 _SESSION_READ_ERROR_MESSAGE = (
     "Failed to read the session for this thread from the session backend."
 )
+# Exception text can name internal resources, configuration or other users'
+# sessions, so a failure is logged and the client gets a stable message.
+_STATE_ERROR_MESSAGE = "Failed to read the state of this thread."
+_CAPABILITIES_ERROR_MESSAGE = "Failed to retrieve capabilities."
 
 
 def _session_read_error_response(thread_id: str) -> JSONResponse:
@@ -522,7 +526,7 @@ def add_adk_fastapi_endpoint(
             logger.error(f"Error in capabilities endpoint: {e}", exc_info=True)
             return JSONResponse(
                 status_code=500,
-                content={"error": f"Failed to retrieve capabilities: {str(e)}"}
+                content={"error": _CAPABILITIES_ERROR_MESSAGE}
             )
 
     @app.post("/agents/state")
@@ -702,7 +706,7 @@ def add_adk_fastapi_endpoint(
                     "threadExists": False,
                     "state": {},
                     "messages": [],
-                    "error": str(e)
+                    "error": _STATE_ERROR_MESSAGE
                 }
             )
 

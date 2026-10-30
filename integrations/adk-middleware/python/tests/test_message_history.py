@@ -1448,7 +1448,7 @@ class TestAgentsStateEndpointFailures:
     @pytest.mark.asyncio
     async def test_failure_outside_session_reads_returns_500(self, caplog):
         """A failure before any session read reaches the outer handler, which
-        returns 500 with the exception text as the error."""
+        returns 500 with a stable message and logs the exception text."""
         service = _FailingSessionService()
         agent = await self._agent_with_mapped_session(service, "outer-thread")
 
@@ -1468,8 +1468,9 @@ class TestAgentsStateEndpointFailures:
             "threadExists": False,
             "state": {},
             "messages": [],
-            "error": "extractor exploded",
+            "error": "Failed to read the state of this thread.",
         }
+        assert "extractor exploded" not in response.text
         assert service.get_calls == 0
         assert any(
             r.name == "ag_ui_adk.endpoint" and "extractor exploded" in r.getMessage()
