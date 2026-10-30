@@ -35,7 +35,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from .adk_agent import ADKAgent
-from .event_translator import adk_events_to_messages
+from .event_translator import adk_events_to_messages, open_interrupts
 from .session_manager import _is_hidden_state_key
 
 logger = logging.getLogger(__name__)
@@ -656,15 +656,24 @@ def add_adk_fastapi_endpoint(
             # Convert messages to dict format for JSON serialization
             messages_dict = [msg.model_dump(by_alias=True) for msg in messages]
 
-            return JSONResponse(content={
+            content = {
                 "threadId": thread_id,
                 "threadExists": thread_exists,
                 "state": {
                     key: value for key, value in state.items()
                     if not _is_hidden_state_key(key)
                 },
-                "messages": messages_dict
-            })
+                "messages": messages_dict,
+            }
+            # A client restoring an interrupted thread needs the interrupts its
+            # closing RUN_FINISHED reported, to answer them with resume. Only an
+            # agent that reports interrupts has any to restore.
+            if getattr(agent, "_emit_interrupt_outcome", False) is True:
+                content["interrupts"] = [
+                    interrupt.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    for interrupt in (open_interrupts(session) if thread_exists else [])
+                ]
+            return JSONResponse(content=content)
 
         except Exception as e:
             logger.error(f"Error in /agents/state endpoint: {e}", exc_info=True)
