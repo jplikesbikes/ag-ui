@@ -217,6 +217,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `/agents/state` and `/capabilities` no longer put an exception's text in
+  their 500 response. Exception text can name internal resources,
+  configuration or other users' sessions; the client now gets a stable message
+  ("Failed to read the state of this thread.", "Failed to retrieve
+  capabilities.") and the exception is logged, as the run endpoint and a session
+  backend read already did.
+
 - A client tool result now resumes the agent on ADK 2.12 when the client's
   history does not include the assistant message with the tool call (#3103).
   The `FunctionResponse` was named `"unknown"`, and ADK 2.12 re-dispatches a
