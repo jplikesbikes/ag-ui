@@ -669,14 +669,12 @@ When using `add_adk_fastapi_endpoint()`, an additional `POST /agents/state` endp
 ```json
 {
   "threadId": "thread_123",
-  "appName": "my_app",
-  "userId": "user_123",
   "name": "optional_agent_name",
   "properties": {}
 }
 ```
 
-The `appName` and `userId` parameters are optional if the `ADKAgent` was configured with static values. When an extractor or resolver is configured, request/extractor-derived identity takes precedence; body `appName` and `userId` are fallback inputs for deployments that configure neither static identity nor extractor-supplied identity.
+The thread is read under the identity a run on the same request would use: `extract_state_from_request` runs first, then the agent's `_get_app_name` / `_get_user_id` (a subclass override, a static value, `app_name_extractor` / `user_id_extractor`, or the defaults). An identity an extractor writes to state counts when the agent's own extractor reads it, which is also what makes a run use it. The body's `appName` and `userId` are deprecated and ignored, and sending them emits a `DeprecationWarning`: a client could otherwise name another app's or user's thread.
 
 **Response:**
 ```json

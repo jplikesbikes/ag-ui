@@ -1648,7 +1648,12 @@ def test_state_endpoint_cache_hit_is_read_under_the_requesting_scope(
     thread, must see an empty thread rather than the first scope's state."""
     service = InMemorySessionService()
     asyncio.run(native(service, "wire", *first_scope, {"todo": "first-secret"}))
-    agent = adapter(service)
+    # The agent reads the request's identity, so a run and the state read agree.
+    agent = adapter(
+        service,
+        app_name_extractor=lambda input: input.state["app_name"],
+        user_id_extractor=lambda input: input.state["user_id"],
+    )
 
     async def identity(request, _input):
         return {
