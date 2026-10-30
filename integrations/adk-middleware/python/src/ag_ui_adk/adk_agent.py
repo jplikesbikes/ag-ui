@@ -76,6 +76,8 @@ from google.genai import types
 from .event_translator import (
     EventTranslator,
     adk_events_to_messages,
+    invocation_outcome,
+    unanswered_call_seals,
     CONFIRM_CHANGES_TOOL_NAME,
     REQUEST_CONFIRMATION_TOOL_NAME,
 )
@@ -972,6 +974,32 @@ class ADKAgent:
             return False
         task = getattr(execution, "task", None)
         return task is None or not task.done()
+
+    async def _seal_failed_invocation(
+        self, session: Any, backend_session_id: str, app_name: str, user_id: str
+    ) -> None:
+        """Close a failed invocation's unanswered calls before a new turn.
+
+        A tool that raised, or a process that died mid-tool, leaves the call
+        without a response. A new message would then reach the model after a
+        call with no answer, which model APIs reject (ADK 1.x) or which ADK
+        drops from the request (ADK 2.x), so the model never learns the call
+        failed. Only a ``failed`` invocation is sealed; a call waiting for the
+        user (``input-required``) is left open.
+        """
+        outcome = invocation_outcome(session, resumable=self._is_adk_resumable())
+        if outcome is None or outcome.state != "failed" or not outcome.invocation_id:
+            return
+        seals = unanswered_call_seals(session.events, outcome.invocation_id)
+        if not seals:
+            return
+        logger.info(
+            "Closing %d unanswered call event(s) of failed invocation %s before a new turn",
+            len(seals), outcome.invocation_id,
+        )
+        for seal in seals:
+            await self._session_manager._session_service.append_event(session, seal)
+        self._session_manager.invalidate_session(backend_session_id, app_name, user_id)
 
     def _get_session_metadata(self, thread_id: str, user_id: str, *, app_name: str) -> Optional[Tuple[str, str, str]]:
         """Get session metadata within an explicit app/user scope.
@@ -4167,6 +4195,10 @@ class ADKAgent:
                 if user_message is None and input.messages:
                     user_message = await self._convert_latest_message(input, input.messages)
                 new_message = user_message
+                if new_message is not None:
+                    await self._seal_failed_invocation(
+                        session, backend_session_id, app_name, user_id
+                    )
 
             # Create a single shared set for tracking tool call IDs emitted by ClientProxyTool.
             # All ClientProxyToolsets in this run reference this set so the EventTranslator

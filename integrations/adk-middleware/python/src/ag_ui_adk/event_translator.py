@@ -1785,6 +1785,79 @@ def invocation_outcome(
     return outcome("failed", INTERRUPTED)
 
 
+#: The message ADK's abort seal answers a dangling call with.
+INVOCATION_ABORTED_MESSAGE = "Invocation was aborted by client."
+
+
+def unanswered_call_seals(events: List[Any], invocation_id: str) -> List[ADKEvent]:
+    """Events that close an invocation's unanswered function calls.
+
+    Each call the invocation made without a response, other than a
+    long-running one (a client tool or confirmation still waiting for its
+    answer), gets an error response, so the history the model sees next pairs
+    every call with a response. Model APIs reject a call with no response
+    (Gemini: "function call turn ... must be followed by a function response
+    turn"); ADK 2.x instead drops the orphaned call, and the model never
+    learns the tool was called.
+
+    The shape is ADK's own abort seal (``google.adk.events._abort_events.
+    _build_abort_events``, ADK >= 2.x; private, so mirrored here with public
+    types): one event per (author, branch, isolation scope) of the calls'
+    events, authored by the agent that issued them, with the original
+    ``invocation_id``, ``error_code`` ``INVOCATION_ABORTED`` and
+    ``{"error": "Invocation was aborted by client."}`` responses. ADK reads
+    such a call as aborted rather than replaying it.
+    """
+    invocation_events = [e for e in events if e.invocation_id == invocation_id]
+    answered = {
+        response.id
+        for event in events
+        for response in event.get_function_responses() or []
+        if response.id
+    }
+    long_running = {
+        tool_id
+        for event in invocation_events
+        for tool_id in getattr(event, "long_running_tool_ids", None) or ()
+    }
+    grouped: Dict[tuple, List[Any]] = {}
+    for event in invocation_events:
+        for call in event.get_function_calls() or []:
+            if call.id and call.id not in answered and call.id not in long_running:
+                key = (event.author, event.branch, getattr(event, "isolation_scope", None))
+                grouped.setdefault(key, []).append(call)
+
+    # ``isolation_scope`` exists on ADK 2.x events only.
+    has_isolation_scope = "isolation_scope" in getattr(ADKEvent, "model_fields", {})
+    seals = []
+    for (author, branch, isolation_scope), calls in grouped.items():
+        extra = {"isolation_scope": isolation_scope} if has_isolation_scope else {}
+        seals.append(
+            ADKEvent(
+                invocation_id=invocation_id,
+                author=author,
+                branch=branch,
+                content=types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                id=call.id,
+                                name=call.name,
+                                response={"error": INVOCATION_ABORTED_MESSAGE},
+                            )
+                        )
+                        for call in calls
+                    ],
+                ),
+                error_code=INVOCATION_ABORTED,
+                error_message=INVOCATION_ABORTED_MESSAGE,
+                **extra,
+            )
+        )
+    return seals
+
+
 def adk_events_to_messages(events: List[ADKEvent]) -> List[Message]:
     """Convert ADK session events to AG-UI Message list.
 
