@@ -239,6 +239,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now includes `pending_tool_calls`) and what the client is not shown. The
   run's context (`_ag_ui_context`) stays visible: it is the client's own input
   (#964).
+- A question paused on one instance stays open on every other one. Open
+  interrupts were read from `pending_tool_calls`, which an instance's first
+  access to a session clears when it has no execution to fulfil them, and a
+  paused question has none. After a restart or on another replica, once a run
+  had touched the session, a run that left the question unanswered was let
+  through, and the answer that followed was skipped as matching no pending
+  call, so the tool never got its decision. Open interrupts are now read from
+  the session: an `adk_request_confirmation` call is open until a
+  FunctionResponse answers it, and `confirm_changes` reviews are kept whole in
+  session state. The interrupt gate, resume correlation and the tool-result
+  gate all use that record.
+
 - A run that answers a tool confirmation and carries a new user message
   re-runs the confirmed tool. The confirmation's FunctionResponse and the
   message went to ADK in one invocation, which made the message the last user

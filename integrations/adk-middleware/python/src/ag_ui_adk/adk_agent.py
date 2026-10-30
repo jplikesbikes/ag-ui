@@ -76,6 +76,7 @@ from google.genai import types
 from .event_translator import (
     EventTranslator,
     adk_events_to_messages,
+    open_interrupts,
     session_history_message_ids,
     AG_UI_MESSAGE_ID_METADATA_KEY,
     messages_snapshot_event,
@@ -89,6 +90,12 @@ from .session_manager import (
     INTERNAL_STATE_KEYS as _INTERNAL_STATE_KEYS,
     _is_internal_state_key,
 )
+
+
+def _review_id(entry: Any) -> Any:
+    """The id of a kept ``confirm_changes`` review: the whole interrupt, or an id alone."""
+    return entry.get("id") if isinstance(entry, dict) else entry
+
 
 # ADK routes state keys carrying these prefixes to app-wide and user-wide
 # scope instead of to the session.
@@ -1092,10 +1099,13 @@ class ADKAgent:
             logger.error(f"Failed to add pending tool call {tool_call_id} to thread {thread_id}: {e}")
 
     async def _add_pending_confirm_changes(
-        self, session_id: str, app_name: str, user_id: str, confirm_ids: List[str]
+        self, session_id: str, app_name: str, user_id: str, reviews: List[Interrupt]
     ) -> None:
-        """Record confirm_changes ids awaiting the user's decision in session state."""
-        if not confirm_ids:
+        """Record confirm_changes reviews awaiting the user's decision in session state.
+
+        Each is kept whole, so ``open_interrupts`` reads it as RUN_FINISHED reported it.
+        """
+        if not reviews:
             return
         try:
             current = await self._session_manager.get_state_value(
@@ -1110,10 +1120,16 @@ class ADKAgent:
                 app_name=app_name,
                 user_id=user_id,
                 key=PENDING_CONFIRM_CHANGES_STATE_KEY,
-                value=list(current) + [i for i in confirm_ids if i not in current],
+                value=list(current) + [
+                    review.model_dump(mode="json", exclude_none=True)
+                    for review in reviews
+                    if review.id not in {_review_id(entry) for entry in current}
+                ],
             )
         except Exception as e:
-            logger.error(f"Failed to persist pending confirm_changes {confirm_ids}: {e}")
+            logger.error(
+                f"Failed to persist pending confirm_changes {[r.id for r in reviews]}: {e}"
+            )
 
     async def _get_pending_confirm_changes(
         self, thread_id: str, user_id: str, *, app_name: str
@@ -1124,15 +1140,16 @@ class ADKAgent:
             return []
         session_id, app_name, user_id = metadata
         try:
-            return list(
-                await self._session_manager.get_state_value(
+            return [
+                _review_id(entry)
+                for entry in await self._session_manager.get_state_value(
                     session_id=session_id,
                     app_name=app_name,
                     user_id=user_id,
                     key=PENDING_CONFIRM_CHANGES_STATE_KEY,
                     default=[],
                 ) or []
-            )
+            ]
         except Exception as e:
             logger.error(f"Failed to read pending confirm_changes for thread {thread_id}: {e}")
             return []
@@ -1153,12 +1170,19 @@ class ADKAgent:
             thread_id, user_id, app_name=app_name
         )
         try:
+            entries = await self._session_manager.get_state_value(
+                session_id=session_id,
+                app_name=app_name,
+                user_id=user_id,
+                key=PENDING_CONFIRM_CHANGES_STATE_KEY,
+                default=[],
+            ) or []
             await self._session_manager.set_state_value(
                 session_id=session_id,
                 app_name=app_name,
                 user_id=user_id,
                 key=PENDING_CONFIRM_CHANGES_STATE_KEY,
-                value=[i for i in pending if i not in answered],
+                value=[e for e in entries if _review_id(e) not in answered],
             )
         except Exception as e:
             logger.error(f"Failed to clear answered confirm_changes {sorted(answered)}: {e}")
@@ -1680,23 +1704,21 @@ class ADKAgent:
         pending_tool_ids = set(
             await self._get_pending_tool_call_ids(input.thread_id, user_id, app_name=app_name) or []
         )
+        # An open interrupt is live by the session's record, which a cleared
+        # pending_tool_calls does not touch.
+        open_interrupt_ids = set(await self._open_interrupt_ids(input, user_id, app_name=app_name))
         has_tool_results_in_unseen = any(getattr(msg, "role", None) == "tool" for msg in unseen_messages)
 
-        if pending_tool_ids and has_tool_results_in_unseen:
+        if (pending_tool_ids or open_interrupt_ids) and has_tool_results_in_unseen:
             # A synthetic confirmation is also live until its decision is
             # consumed. Keep an earlier answer to it in a mixed result batch.
-            live_result_ids = pending_tool_ids | {
+            live_result_ids = pending_tool_ids | open_interrupt_ids | {
                 interrupt_id
                 for interrupt_id, tool_name in self._open_interrupts.get(
                     cache_key, {}
                 ).items()
                 if tool_name == CONFIRM_CHANGES_TOOL_NAME
             }
-            live_result_ids.update(
-                await self._get_pending_confirm_changes(
-                    input.thread_id, user_id, app_name=app_name
-                )
-            )
             # Restored history may contain earlier completed tool results. Only
             # a result answering a live call or confirmation is the boundary;
             # starting at a historical result can replay the old user prompt.
@@ -1760,9 +1782,10 @@ class ADKAgent:
                 ]
                 pending_tool_call_ids = await self._get_pending_tool_call_ids(input.thread_id, user_id, app_name=app_name)
 
-                # confirm_changes is never a pending ADK call; its result is
-                # live only while that id is still awaiting a decision (session
-                # state, shared across instances; or this instance's record).
+                # An answer to an open interrupt is live while it awaits a
+                # decision, by the session's record (or this instance's):
+                # confirm_changes is never a pending ADK call, and a new
+                # instance clears a confirmation's pending entry.
                 answers_open_confirm = False
                 if tool_call_ids:
                     open_confirm_ids = {
@@ -1770,11 +1793,7 @@ class ADKAgent:
                         for interrupt_id, tool_name in self._open_interrupts.get(cache_key, {}).items()
                         if tool_name == CONFIRM_CHANGES_TOOL_NAME
                     }
-                    open_confirm_ids.update(
-                        await self._get_pending_confirm_changes(
-                            input.thread_id, user_id, app_name=app_name
-                        )
-                    )
+                    open_confirm_ids.update(open_interrupt_ids)
                     answers_open_confirm = any(
                         tool_call_id in open_confirm_ids for tool_call_id in tool_call_ids
                     )
@@ -2028,26 +2047,34 @@ class ADKAgent:
     async def _open_interrupt_ids(
         self, input: RunAgentInput, user_id: str, *, app_name: str
     ) -> List[str]:
-        """Interrupts still awaiting an answer on this thread, from session state.
+        """Interrupts still awaiting an answer on this thread (see ``open_interrupts``).
 
-        Pending ``adk_request_confirmation`` calls and open ``confirm_changes``
+        Unanswered ``adk_request_confirmation`` calls and open ``confirm_changes``
         reviews. Other pending long-running calls (frontend tools) are not
         interrupts.
         """
-        open_ids: List[str] = []
-        pending_ids = await self._get_pending_tool_call_ids(
-            input.thread_id, user_id, app_name=app_name
-        )
-        for call_id in pending_ids or []:
-            name = await self._find_pending_call_name(input, user_id, call_id, app_name=app_name)
-            if name == REQUEST_CONFIRMATION_TOOL_NAME:
-                open_ids.append(call_id)
-        for confirm_id in await self._get_pending_confirm_changes(
-            input.thread_id, user_id, app_name=app_name
-        ):
-            if confirm_id not in open_ids:
-                open_ids.append(confirm_id)
-        return open_ids
+        return [
+            interrupt.id
+            for interrupt in await self._session_open_interrupts(
+                input.thread_id, user_id, app_name=app_name
+            )
+        ]
+
+    async def _session_open_interrupts(
+        self, thread_id: str, user_id: str, *, app_name: str
+    ) -> List[Interrupt]:
+        """``open_interrupts`` of this thread's session.
+
+        Read from the session's events and the reviews kept in its state, never
+        from ``pending_tool_calls``: an instance's first access to a session
+        clears that list when no execution is active, and a paused question has
+        none, so it would read empty after a restart or on another replica.
+        """
+        backend_session_id = self._get_backend_session_id(thread_id, user_id, app_name=app_name)
+        if not backend_session_id:
+            return []
+        session = await self._session_manager.get_session(backend_session_id, app_name, user_id)
+        return open_interrupts(session) if session is not None else []
 
     async def _check_interrupt_resume(
         self, input: RunAgentInput, user_id: str, *, app_name: str
@@ -2103,10 +2130,15 @@ class ADKAgent:
             await self._get_pending_tool_call_ids(input.thread_id, user_id, app_name=app_name) or []
         )
         open_interrupts = dict(self._open_interrupts.get((input.thread_id, user_id, app_name), {}))
-        for confirm_id in await self._get_pending_confirm_changes(
+        for interrupt in await self._session_open_interrupts(
             input.thread_id, user_id, app_name=app_name
         ):
-            open_interrupts.setdefault(confirm_id, CONFIRM_CHANGES_TOOL_NAME)
+            open_interrupts.setdefault(
+                interrupt.id,
+                CONFIRM_CHANGES_TOOL_NAME
+                if interrupt.reason == "confirm_changes"
+                else REQUEST_CONFIRMATION_TOOL_NAME,
+            )
 
         resolved: List[Tuple[Any, str]] = []
         for entry in input.resume:
@@ -4811,7 +4843,7 @@ class ADKAgent:
                     app_name,
                     user_id,
                     [
-                        interrupt.id
+                        interrupt
                         for interrupt in event_translator.pending_interrupts
                         if interrupt.reason == "confirm_changes"
                     ],
