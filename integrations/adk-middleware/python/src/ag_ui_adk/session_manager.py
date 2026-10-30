@@ -38,6 +38,31 @@ def _is_processed_message_state_key(key: Any) -> bool:
     )
 
 
+# Session-state keys managed exclusively by the backend: stale ``input.state``
+# values sent back cannot overwrite them.
+INTERNAL_STATE_KEYS = frozenset({
+    "lro_tool_call_id_remap",
+    "pending_tool_calls",
+    CONTEXT_STATE_KEY,
+    THREAD_ID_STATE_KEY,
+    APP_NAME_STATE_KEY,
+    USER_ID_STATE_KEY,
+    INVOCATION_ID_STATE_KEY,
+    PENDING_CONFIRM_CHANGES_STATE_KEY,
+})
+
+
+def _is_internal_state_key(key: Any) -> bool:
+    """Whether ``input.state`` may not write this key."""
+    return key in INTERNAL_STATE_KEYS or _is_processed_message_state_key(key)
+
+
+def _is_hidden_state_key(key: Any) -> bool:
+    """Whether the client never sees this key. The run's context stays visible:
+    it is the client's own input, echoed back (#964)."""
+    return key != CONTEXT_STATE_KEY and _is_internal_state_key(key)
+
+
 _SESSION_READ_CACHE: ContextVar[Optional[Dict[Tuple[str, str, str], Any]]] = (
     ContextVar("ag_ui_adk_session_read_cache", default=None)
 )
