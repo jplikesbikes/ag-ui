@@ -156,6 +156,10 @@ policy.
 ## Error Handling
 
 - RunErrorEvent for various failure scenarios
+- A run whose last ADK event is a model error response (an `error_code`
+  without content, e.g. `SAFETY` or `MALFORMED_FUNCTION_CALL`) ends in
+  `RUN_ERROR` with that `code` and a fixed `message`; ADK's `error_message` is
+  not forwarded
 - Proper async exception handling
 - Resource cleanup on errors
 - Timeout management at multiple levels
