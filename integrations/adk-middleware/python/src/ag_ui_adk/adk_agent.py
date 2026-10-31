@@ -75,6 +75,8 @@ from google.genai import types
 
 from .event_translator import (
     EventTranslator,
+    INTERRUPTED,
+    INTERRUPTED_IN_TOOL,
     adk_events_to_messages,
     open_interrupts,
     session_history_message_ids,
@@ -420,6 +422,9 @@ class ADKAgent:
 
         # First-run history
         seed_first_run_history: bool = True,
+
+        # Retrying a failed run
+        resume_failed_invocations: bool = False,
     ):
         """Initialize the ADKAgent.
 
@@ -542,6 +547,24 @@ class ADKAgent:
                 left out. Runs on an existing session are unaffected: the session
                 is the source of truth there. Set to False to start a new session
                 from the latest user message only, as earlier releases did.
+            resume_failed_invocations: When True, a run with no new message (a
+                client retrying with the history it already sent) resumes the
+                thread's latest invocation if it failed: a tool or model raised,
+                the model returned an error response, or the process died
+                mid-turn. ADK continues it with
+                ``Runner.run_async(invocation_id=..., new_message=None)``: a call
+                left without a response by a dead process is executed again,
+                a call whose tool raised is first closed as aborted (so the
+                model sees it failed and the tool is not re-run), and otherwise
+                the model is called again. Delivery is at least once: a tool
+                that was running when the process died runs again, so tools
+                with side effects must tolerate a repeat. A completed, canceled,
+                paused or running invocation is never resumed (resuming a
+                completed one would repeat its turn); such a run still ends in
+                an empty ``RUN_STARTED`` / ``RUN_FINISHED``. Requires an ADK
+                resumable app (``from_app()`` with
+                ``ResumabilityConfig(is_resumable=True)``); ignored otherwise.
+                Defaults to False.
 
             Note:
             If delete_session_on_cleanup=False but save_session_to_memory_on_cleanup=True, sessions will accumulate in SessionService but still be saved to memory on cleanup.
@@ -675,6 +698,8 @@ class ADKAgent:
         self._emit_interrupt_outcome = emit_interrupt_outcome
         # Seed a new session with the client's earlier messages (see docstring).
         self._seed_first_run_history = seed_first_run_history
+        # Resume a failed invocation on a run with nothing new (see docstring).
+        self._resume_failed_invocations = resume_failed_invocations
 
         # Streaming function call arguments (Gemini 3+ via Vertex AI)
         if streaming_function_call_arguments and not self._adk_supports_streaming_fc_args():
@@ -872,6 +897,7 @@ class ADKAgent:
         emit_interrupt_outcome: bool = False,
         # First-run history
         seed_first_run_history: bool = True,
+        resume_failed_invocations: bool = False,
     ) -> "ADKAgent":
         """Create ADKAgent from an ADK App instance.
 
@@ -925,6 +951,9 @@ class ADKAgent:
             seed_first_run_history: Write the client's earlier messages into a
                 thread's new session on its first run. Defaults to True; see
                 ADKAgent.__init__.
+            resume_failed_invocations: Resume the thread's latest invocation
+                when it failed and a run brings no new message (a retry).
+                Defaults to False; at-least-once, see ADKAgent.__init__.
 
         Returns:
             ADKAgent instance configured to use the App
@@ -975,6 +1004,7 @@ class ADKAgent:
             capabilities=capabilities,
             emit_interrupt_outcome=emit_interrupt_outcome,
             seed_first_run_history=seed_first_run_history,
+            resume_failed_invocations=resume_failed_invocations,
         )
         # Store App for per-request App creation with modified agents
         instance._app = app
@@ -1002,6 +1032,57 @@ class ADKAgent:
             return False
         task = getattr(execution, "task", None)
         return task is None or not task.done()
+
+    async def _resume_failed_invocation(
+        self, input: RunAgentInput, user_id: str, app_name: str
+    ) -> AsyncGenerator[BaseEvent, None]:
+        """Resume the thread's latest invocation if it failed; yield nothing otherwise.
+
+        Called for a run that brings no new message (a retry). Only a
+        ``failed`` invocation is resumed: ADK re-runs a completed one as a new
+        turn, and a paused, canceled or running one is not this run's to
+        continue. A call whose tool raised is first closed in ADK's abort-seal
+        shape, so ADK continues to the model, which sees the call failed,
+        instead of treating the invocation as done; a call left open by a dead
+        process is not closed, so ADK executes it again (at least once).
+        """
+        try:
+            session = await self._session_manager.resolve_existing_session(
+                input.thread_id, app_name, user_id
+            )
+        except Exception:
+            _log_session_lookup_failure(input.thread_id, app_name, user_id)
+            yield RunStartedEvent(
+                type=EventType.RUN_STARTED,
+                thread_id=input.thread_id,
+                run_id=input.run_id,
+                protocol_version=PROTOCOL_VERSION,
+            )
+            yield _session_lookup_error_event()
+            return
+        if session is None:
+            return
+        outcome = invocation_outcome(
+            session,
+            live=self._has_live_execution(input.thread_id, user_id, app_name=app_name),
+        )
+        if outcome is None or outcome.state != "failed" or not outcome.invocation_id:
+            return
+        if outcome.code not in (INTERRUPTED_IN_TOOL, INTERRUPTED):
+            # The invocation recorded an error: a call it left open raised.
+            seals = unanswered_call_seals(session.events, outcome.invocation_id)
+            for seal in seals:
+                await self._session_manager._session_service.append_event(session, seal)
+            if seals:
+                self._session_manager.invalidate_session(session.id, app_name, user_id)
+        logger.info(
+            "Resuming failed invocation %s (%s) of thread %s",
+            outcome.invocation_id, outcome.code, input.thread_id,
+        )
+        async for event in self._start_new_execution(
+            input, message_batch=[], failed_invocation_id=outcome.invocation_id
+        ):
+            yield event
 
     async def _seal_failed_invocation(
         self, session: Any, backend_session_id: str, app_name: str, user_id: str
@@ -1690,6 +1771,14 @@ class ADKAgent:
             )
             yield _session_lookup_error_event()
             return
+
+        if not unseen_messages and self._resume_failed_invocations and self._is_adk_resumable():
+            resumed = False
+            async for event in self._resume_failed_invocation(input, user_id, app_name):
+                resumed = True
+                yield event
+            if resumed:
+                return
 
         if not unseen_messages:
             # Nothing new to act on. Terminate cleanly rather than starting an execution:
@@ -3476,6 +3565,7 @@ class ADKAgent:
         message_batch: Optional[List[Any]] = None,
         on_accepted: Optional[Callable[[], Awaitable[None]]] = None,
         history_seed: Optional[List[Any]] = None,
+        failed_invocation_id: Optional[str] = None,
     ) -> AsyncGenerator[BaseEvent, None]:
         """Start a new ADK execution with tool support.
 
@@ -3542,6 +3632,11 @@ class ADKAgent:
                 message_batch=message_batch,
                 **({"on_accepted": on_accepted} if on_accepted is not None else {}),
                 **({"history_seed": history_seed} if history_seed else {}),
+                **(
+                    {"failed_invocation_id": failed_invocation_id}
+                    if failed_invocation_id
+                    else {}
+                ),
             )
             
             # Store execution (replacing any previous one)
@@ -3732,6 +3827,7 @@ class ADKAgent:
         message_batch: Optional[List[Any]] = None,
         on_accepted: Optional[Callable[[], Awaitable[None]]] = None,
         history_seed: Optional[List[Any]] = None,
+        failed_invocation_id: Optional[str] = None,
     ) -> ExecutionState:
         """Start ADK execution in background with tool support.
 
@@ -4000,6 +4096,9 @@ class ADKAgent:
         if history_seed:
             run_kwargs["history_seed"] = history_seed
 
+        if failed_invocation_id:
+            run_kwargs["failed_invocation_id"] = failed_invocation_id
+
         task = asyncio.create_task(self._run_adk_in_background(**run_kwargs))
         logger.debug(f"Background task created for thread {input.thread_id}: {task}")
 
@@ -4024,6 +4123,7 @@ class ADKAgent:
         message_batch: Optional[List[Any]] = None,
         on_accepted: Optional[Callable[[], Awaitable[None]]] = None,
         history_seed: Optional[List[Any]] = None,
+        failed_invocation_id: Optional[str] = None,
     ):
         """Run ADK agent in background, emitting events to queue.
 
@@ -4422,7 +4522,8 @@ class ADKAgent:
                 # No tool results, just use the user message
                 # If user_message is None (e.g., unseen_messages was empty because all were
                 # already processed), fall back to extracting the latest user message from input.messages
-                if user_message is None and input.messages:
+                # Resuming an invocation sends no message: ADK continues it.
+                if user_message is None and input.messages and not failed_invocation_id:
                     user_message = await self._convert_latest_message(input, input.messages)
                     user_message_id = self._latest_user_message_id(input.messages)
                 new_message = user_message
@@ -4571,6 +4672,10 @@ class ADKAgent:
                 # Tool response case (ADK < 1.30): use client's run_id as invocation_id
                 run_kwargs["invocation_id"] = tool_only_invocation_id
                 logger.debug(f"Tool response with explicit invocation_id: {tool_only_invocation_id}")
+            if failed_invocation_id:
+                # Continue a failed invocation (resume_failed_invocations).
+                run_kwargs["invocation_id"] = failed_invocation_id
+                run_kwargs["new_message"] = None
 
             # mark_messages_processed keeps the ledger in process memory, so a
             # replica that did not serve this turn would treat the client's
