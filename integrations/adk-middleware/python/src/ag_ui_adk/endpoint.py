@@ -35,7 +35,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from .adk_agent import ADKAgent
-from .event_translator import adk_events_to_messages, open_interrupts
+from .event_translator import adk_events_to_messages, invocation_outcome, open_interrupts
 from .session_manager import _is_hidden_state_key
 
 logger = logging.getLogger(__name__)
@@ -317,12 +317,24 @@ class AgentStateRequest(BaseModel):
     properties: Optional[Any] = None
 
 
+class RunStatus(BaseModel):
+    """How a thread's latest run ended, in A2A task-state terms.
+
+    ``state`` is one of ``working``, ``input-required``, ``completed``,
+    ``failed`` or ``canceled``; ``code`` says why (see
+    ``ag_ui_adk.InvocationOutcome``).
+    """
+    state: str
+    code: Optional[str] = None
+
+
 class AgentStateResponse(BaseModel):
     """Response body for /agents/state endpoint."""
     threadId: str
     threadExists: bool
     state: dict
     messages: list
+    runStatus: Optional[RunStatus] = None
 
 
 def _header_to_key(header_name: str) -> str:
@@ -552,7 +564,7 @@ def add_adk_fastapi_endpoint(
             request: Underlying FastAPI ``Request`` (used by the extractor pipeline)
 
         Returns:
-            JSON response with threadId, threadExists, state, and messages
+            JSON response with threadId, threadExists, state, messages and runStatus
         """
         thread_id = request_data.threadId
 
@@ -677,6 +689,19 @@ def add_adk_fastapi_endpoint(
                     interrupt.model_dump(mode="json", by_alias=True, exclude_none=True)
                     for interrupt in (open_interrupts(session) if thread_exists else [])
                 ]
+            # How the latest run ended, so a client restoring the thread can
+            # tell a finished turn from a failed or interrupted one.
+            run_status = (
+                invocation_outcome(
+                    session,
+                    live=agent._has_live_execution(thread_id, user_id, app_name=app_name),
+                    resumable=agent._is_adk_resumable(),
+                )
+                if thread_exists
+                else None
+            )
+            if run_status is not None:
+                content["runStatus"] = run_status.to_run_status()
             return JSONResponse(content=content)
 
         except Exception as e:

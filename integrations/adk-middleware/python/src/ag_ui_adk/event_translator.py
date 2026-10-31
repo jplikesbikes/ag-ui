@@ -5,7 +5,7 @@
 import base64
 import dataclasses
 from collections.abc import Iterable, Mapping
-from typing import AsyncGenerator, Optional, Dict, Any, List, Set, Tuple
+from typing import AsyncGenerator, Optional, Dict, Any, List, Literal, Set, Tuple
 import uuid
 
 from google.genai import types
@@ -1643,6 +1643,242 @@ def _is_thought_part(part: Any) -> bool:
         return False
     thought_value = getattr(part, 'thought', None)
     return thought_value is True
+
+
+# Run outcome ------------------------------------------------------------------
+#
+# How a session's latest invocation ended, derived from the events ADK already
+# persists. The states are A2A's task states, so an A2A surface over the same
+# session reports the same thing.
+
+RunState = Literal["working", "input-required", "completed", "failed", "canceled"]
+
+#: The ``error_code`` ADK writes when it seals an invocation aborted by the
+#: caller (``Runner.run_async(abort_signal=...)``).
+INVOCATION_ABORTED = "INVOCATION_ABORTED"
+#: The invocation stopped while a tool call it made had no response: the
+#: process died or the task was cancelled mid-tool (on ADK 1.x, also a tool
+#: that raised).
+INTERRUPTED_IN_TOOL = "INTERRUPTED_IN_TOOL"
+#: The invocation stopped with no completion marker and no recorded error.
+INTERRUPTED = "INTERRUPTED"
+#: The invocation completed without the agent saying anything.
+EMPTY_REPLY = "EMPTY_REPLY"
+
+# Session writes that are not part of a turn: this package's state updates
+# (``SessionManager.update_session_state``) and its first-run history seed.
+_OUT_OF_BAND_INVOCATION_PREFIXES = ("state_update_", "agui-history-")
+
+
+@dataclasses.dataclass(frozen=True)
+class InvocationOutcome:
+    """How a session's latest invocation ended.
+
+    ``state`` is an A2A task state. ``code`` says why, for a ``failed`` or
+    ``canceled`` invocation and for an empty reply: the ADK ``error_code``
+    (``SAFETY``, ``MALFORMED_FUNCTION_CALL``, an exception class name on ADK
+    2.x, ``INVOCATION_ABORTED``) or one of ``INTERRUPTED_IN_TOOL``,
+    ``INTERRUPTED`` and ``EMPTY_REPLY``. ADK's ``error_message`` is deliberately
+    not carried: it can hold provider or exception detail not meant for a
+    client.
+    """
+
+    state: RunState
+    code: Optional[str] = None
+    invocation_id: Optional[str] = None
+
+    def to_run_status(self) -> Dict[str, str]:
+        """The client-facing ``{"state", "code"?}`` form."""
+        status: Dict[str, str] = {"state": self.state}
+        if self.code:
+            status["code"] = self.code
+        return status
+
+
+def _event_actions(event: Any) -> Any:
+    return getattr(event, "actions", None)
+
+
+def _has_parts(event: Any) -> bool:
+    content = getattr(event, "content", None)
+    return bool(content is not None and getattr(content, "parts", None))
+
+
+def _is_turn_event(event: Any) -> bool:
+    """Whether an event belongs to an invocation's turn.
+
+    A write made between runs (a state update appended by this package or by
+    the application) carries no content, error or agent lifecycle marker, and
+    must not be read as the latest turn.
+    """
+    invocation_id = getattr(event, "invocation_id", None) or ""
+    if invocation_id.startswith(_OUT_OF_BAND_INVOCATION_PREFIXES):
+        return False
+    if _has_parts(event) or _error_code_of(event):
+        return True
+    actions = _event_actions(event)
+    return bool(
+        actions is not None
+        and (
+            getattr(actions, "end_of_agent", None)
+            or getattr(actions, "agent_state", None) is not None
+            or getattr(actions, "transfer_to_agent", None)
+            or getattr(actions, "escalate", None)
+        )
+    )
+
+
+def _error_code_of(event: Any) -> Optional[str]:
+    """An event's ``error_code`` as a plain string, or None.
+
+    ADK sets it from the model's ``finish_reason`` / ``block_reason``, so it can
+    be a ``types.FinishReason`` member rather than a ``str``.
+    """
+    code = getattr(event, "error_code", None)
+    code = getattr(code, "value", code)
+    return code if isinstance(code, str) and code else None
+
+
+def _is_significant(event: Any) -> bool:
+    """Content or an error: not a bare lifecycle marker or a streaming chunk."""
+    if _error_code_of(event):
+        return True
+    return _has_parts(event) and not getattr(event, "partial", False)
+
+
+def latest_invocation_id(session: Any) -> Optional[str]:
+    """The invocation id of a session's latest turn, or None if it has none."""
+    for event in reversed(getattr(session, "events", None) or []):
+        if _is_turn_event(event):
+            return event.invocation_id
+    return None
+
+
+def _closed_by_adk(events: List[Any], last: Any) -> bool:
+    """Whether ADK recorded the invocation as completed (resumable apps).
+
+    A resumable app writes ``end_of_agent`` when an agent finishes, and an
+    ``agent_state`` checkpoint while a composite agent is part way through its
+    sub-agents. The invocation completed when it ends on an ``end_of_agent``,
+    no agent is left part way, the agent that spoke last closed after it spoke,
+    and that last word was not a hand-off: on ``transfer_to_agent`` the
+    transferring agent closes before the target runs.
+    """
+    if not getattr(_event_actions(events[-1]), "end_of_agent", None):
+        return False
+    if last is not None and getattr(_event_actions(last), "transfer_to_agent", None):
+        return False
+    part_way: Set[str] = set()
+    for event in events:
+        actions = _event_actions(event)
+        if actions is None:
+            continue
+        if getattr(actions, "end_of_agent", None):
+            part_way.discard(event.author)
+        elif getattr(actions, "agent_state", None) is not None:
+            part_way.add(event.author)
+    if part_way:
+        return False
+    if last is None or last.author == "user":
+        return True
+    after = events[events.index(last) + 1:]
+    return any(
+        event.author == last.author and getattr(_event_actions(event), "end_of_agent", None)
+        for event in after
+    )
+
+
+def invocation_outcome(
+    session: Any, live: bool = False, *, resumable: bool = True
+) -> Optional[InvocationOutcome]:
+    """How the session's latest invocation ended, read from its events alone.
+
+    Args:
+        session: An ADK session (its ``events`` and ``state``).
+        live: Whether an execution of this session is running right now. A
+            session cannot tell a running invocation from one whose process
+            died, so the caller says so.
+        resumable: Whether the app uses ADK resumability
+            (``ResumabilityConfig(is_resumable=True)``). Only then does ADK
+            write the ``end_of_agent`` markers that record completion. Without
+            them an invocation counts as completed when its last event is an
+            agent's final response, so an empty reply reads as ``INTERRUPTED``.
+
+    Returns:
+        None when the session has no turn yet, else:
+
+        - ``working`` while ``live``;
+        - ``input-required`` while a long-running call (a client tool, an
+          ``adk_request_confirmation``) or a predictive-state review waits for
+          its answer;
+        - ``canceled`` when ADK sealed it as aborted;
+        - ``failed`` when its last event is an ADK error response, an
+          ``error_code`` without content (``code`` is the ``error_code``),
+          even if an ``end_of_agent`` follows it; when a call
+          it made has no response (``INTERRUPTED_IN_TOOL``); or when it
+          stopped without completing (``INTERRUPTED``);
+        - ``completed`` otherwise, with ``code`` ``EMPTY_REPLY`` when no agent
+          said anything.
+    """
+    turn = [event for event in getattr(session, "events", None) or [] if _is_turn_event(event)]
+    if not turn:
+        return None
+    invocation_id = turn[-1].invocation_id
+
+    def outcome(state: RunState, code: Optional[str] = None) -> InvocationOutcome:
+        return InvocationOutcome(state=state, code=code, invocation_id=invocation_id)
+
+    if live:
+        return outcome("working")
+
+    events = [event for event in turn if event.invocation_id == invocation_id]
+    answered = {
+        response.id
+        for event in session.events
+        for response in event.get_function_responses() or []
+        if response.id
+    }
+    open_calls = [
+        call.id
+        for event in events
+        for call in event.get_function_calls() or []
+        if call.id and call.id not in answered
+    ]
+    long_running = {
+        tool_id
+        for event in events
+        for tool_id in getattr(event, "long_running_tool_ids", None) or ()
+    }
+    state = getattr(session, "state", None) or {}
+    if any(call_id in long_running for call_id in open_calls) or state.get(
+        PENDING_CONFIRM_CHANGES_STATE_KEY
+    ):
+        return outcome("input-required")
+
+    significant = [event for event in events if _is_significant(event)]
+    last = significant[-1] if significant else None
+    error_code = _error_code_of(last)
+    if error_code == INVOCATION_ABORTED:
+        return outcome("canceled", INVOCATION_ABORTED)
+    # ADK also copies a non-STOP finish_reason (MAX_TOKENS, ...) onto a
+    # response that has content; that response is the answer, not an error.
+    if error_code and not _has_parts(last):
+        return outcome("failed", error_code)
+    if open_calls:
+        return outcome("failed", INTERRUPTED_IN_TOOL)
+
+    agent_spoke = last is not None and last.author != "user"
+    if resumable:
+        closed = _closed_by_adk(events, last)
+    else:
+        closed = (
+            agent_spoke
+            and last.is_final_response()
+            and not getattr(_event_actions(last), "transfer_to_agent", None)
+        )
+    if closed:
+        return outcome("completed", None if agent_spoke else EMPTY_REPLY)
+    return outcome("failed", INTERRUPTED)
 
 
 def adk_events_to_messages(events: List[ADKEvent]) -> List[Message]:
