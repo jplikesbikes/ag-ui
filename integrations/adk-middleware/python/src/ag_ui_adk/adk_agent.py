@@ -152,6 +152,36 @@ def _session_lookup_error_event() -> RunErrorEvent:
     )
 
 
+# ADK writes this error_code when it seals an invocation the caller aborted;
+# that is a cancellation, not an error.
+_INVOCATION_ABORTED = "INVOCATION_ABORTED"
+
+
+def _error_code_of(adk_event: Any) -> Optional[str]:
+    """An ADK event's ``error_code`` as a plain string, or None.
+
+    ADK sets it from the model's ``finish_reason`` / ``block_reason``, so it can
+    be a ``types.FinishReason`` member rather than a ``str``.
+    """
+    code = getattr(adk_event, "error_code", None)
+    code = getattr(code, "value", code)
+    return code if isinstance(code, str) and code else None
+
+
+def _model_error_event(error_code: str) -> RunErrorEvent:
+    """The RUN_ERROR for a run whose last word was an ADK error response.
+
+    The ``error_code`` (``SAFETY``, ``MALFORMED_FUNCTION_CALL``, ...) is what a
+    client acts on. ADK's ``error_message`` is not forwarded: it can carry
+    provider or exception detail that is not meant for the client.
+    """
+    return RunErrorEvent(
+        type=EventType.RUN_ERROR,
+        message="The model returned an error instead of a response.",
+        code=error_code,
+    )
+
+
 class _HitlDeferringQueue(asyncio.Queue):
     """``asyncio.Queue`` that defers HITL ``ToolCallEndEvent``s.
 
@@ -4526,12 +4556,35 @@ class ADKAgent:
 
             logger.debug(f"Calling runner.run_async with session_id={backend_session_id}, has_message={new_message is not None}")
 
+            # The error_code of an ADK error response (SAFETY,
+            # MALFORMED_FUNCTION_CALL, ...) when it is the last thing the run
+            # produced. ADK persists the response and closes the agent
+            # normally, and the translator has nothing to show for it, so the
+            # run would otherwise end in a RUN_FINISHED with no output.
+            model_error_code: Optional[str] = None
+
             self._session_manager.disable_session_read_cache()
             async for adk_event in runner.run_async(**run_kwargs):
                 event_invocation_id = getattr(adk_event, 'invocation_id', None)
                 event_author = getattr(adk_event, 'author', 'unknown')
                 event_partial = getattr(adk_event, 'partial', False)
                 event_turn_complete = getattr(adk_event, 'turn_complete', None)
+
+                # An error response is an error_code without content. ADK also
+                # copies a non-STOP finish_reason (MAX_TOKENS, ...) onto a
+                # response that has content; that response is the answer.
+                # Content after an error response means the run recovered;
+                # bare lifecycle markers (end_of_agent) don't count.
+                if not event_partial:
+                    if adk_event.content and getattr(adk_event.content, 'parts', None):
+                        model_error_code = None
+                    else:
+                        event_error_code = _error_code_of(adk_event)
+                        if event_error_code:
+                            model_error_code = (
+                                None if event_error_code == _INVOCATION_ABORTED
+                                else event_error_code
+                            )
 
                 # Log which agent is producing events
                 content_preview = ""
@@ -4883,6 +4936,15 @@ class ADKAgent:
             await self._finalize_hitl_buffer(
                 event_queue, input.thread_id, app_name, user_id
             )
+            if model_error_code is not None:
+                logger.warning(
+                    "Run for thread %s ended on an ADK error response (%s)",
+                    input.thread_id, model_error_code,
+                )
+                # RUN_ERROR is terminal: release anything still deferred first.
+                if isinstance(event_queue, _HitlDeferringQueue):
+                    await event_queue.flush_deferred()
+                await event_queue.put(_model_error_event(model_error_code))
             logger.debug(f"Background task sending completion signal for thread {input.thread_id}")
             await event_queue.put(None)
             logger.debug(f"Background task completion signal sent for thread {input.thread_id}")
