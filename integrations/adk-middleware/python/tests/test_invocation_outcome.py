@@ -15,6 +15,7 @@ them.
 
 from typing import Any, List, Optional
 
+import google.adk
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -93,6 +94,22 @@ def ev(
     )
 
 
+def reply(
+    *parts: types.Part, error: Any = None, finish_reason: Any = None, inv: str = "e-1"
+) -> Event:
+    """A model response event with the given parts."""
+    return Event(
+        invocation_id=inv,
+        author="root",
+        content=types.Content(role="model", parts=list(parts)),
+        error_code=error,
+        finish_reason=finish_reason,
+    )
+
+
+THOUGHT = types.Part(text="thinking it over", thought=True)
+
+
 def session(*events: Event, state: Optional[dict] = None) -> Session:
     return Session(id="s", app_name="app", user_id="u", state=state or {}, events=list(events))
 
@@ -165,6 +182,17 @@ SHAPES = {
         [USER, ev("root", empty_parts=True), ev("root", end=True)],
         ("completed", EMPTY_REPLY),
     ),
+    # A finish reason google.genai does not define (a provider's, a mock's).
+    "reply with an unknown code": (
+        [USER, reply(types.Part(text="the answer"), error="FUNCTION_CALL"),
+         ev("root", end=True)],
+        ("completed", None),
+    ),
+    "reply with reasoning, cut at MAX_TOKENS": (
+        [USER, reply(THOUGHT, types.Part(text="a long answer, cut"), error="MAX_TOKENS"),
+         ev("root", end=True)],
+        ("completed", None),
+    ),
     # -- input-required -------------------------------------------------------
     "paused on a tool confirmation": (
         [USER, ev("root", call="guarded"), ev("root", response="guarded"),
@@ -183,6 +211,27 @@ SHAPES = {
     # -- failed ---------------------------------------------------------------
     "model error response": (
         [USER, ev("root", error="SAFETY"), ev("root", end=True)],
+        ("failed", "SAFETY"),
+    ),
+    # An error response whose only parts say nothing to the user is still an
+    # error response.
+    "error response with only reasoning": (
+        [USER, reply(THOUGHT, error="MALFORMED_FUNCTION_CALL"), ev("root", end=True)],
+        ("failed", "MALFORMED_FUNCTION_CALL"),
+    ),
+    "error response with blank text": (
+        [USER, reply(types.Part(text=" \n"), error="SAFETY"), ev("root", end=True)],
+        ("failed", "SAFETY"),
+    ),
+    # ADK 2.x marks a STOP response with nothing in it.
+    "no content, with reasoning (ADK 2.x)": (
+        [USER, reply(THOUGHT, error="MODEL_RETURNED_NO_CONTENT"), ev("root", end=True)],
+        ("failed", "MODEL_RETURNED_NO_CONTENT"),
+    ),
+    # Streaming, ADK aggregates the text it got before the model stopped onto
+    # the final response, with the finish reason as its error_code.
+    "partial text, then blocked": (
+        [USER, reply(types.Part(text="Hel"), error="SAFETY"), ev("root", end=True)],
         ("failed", "SAFETY"),
     ),
     "malformed function call": (
@@ -346,6 +395,28 @@ def test_a_pending_predictive_state_review_is_input_required():
     assert state_and_code(invocation_outcome(reviewed)) == ("input-required", None)
 
 
+@pytest.mark.parametrize(
+    "later, expected",
+    [
+        ([ev("user", inv="e-2", text="next"), ev("root", inv="e-2", error="SAFETY"),
+          ev("root", inv="e-2", end=True)], ("failed", "SAFETY")),
+        ([ev("user", inv="e-2", text="next"), ev("root", inv="e-2", call="slow")],
+         ("failed", INTERRUPTED_IN_TOOL)),
+        ([ev("user", inv="e-2", text="next")], ("failed", INTERRUPTED)),
+        ([ev("user", inv="e-2", text="next"), ev("root", inv="e-2", text="ok"),
+          ev("root", inv="e-2", end=True)], ("input-required", None)),
+    ],
+    ids=["model error", "killed mid-tool", "killed", "completed"],
+)
+def test_a_pending_review_does_not_hide_a_later_failure(later, expected):
+    reviewed = session(
+        USER, ev("root", text="proposed"), ev("root", end=True), *later,
+        state={PENDING_CONFIRM_CHANGES_STATE_KEY: ["review-1"]},
+    )
+
+    assert state_and_code(invocation_outcome(reviewed)) == expected
+
+
 def test_an_answered_client_tool_is_no_longer_input_required():
     answered = outcome(
         USER, ev("root", call="client_tool", lro=True),
@@ -474,13 +545,18 @@ async def run_once(root, *, resumable: bool = True) -> Session:
         (lambda: llm_root([calls("client_tool", q="x")]), ("input-required", None)),
         (lambda: llm_root([LlmResponse(error_code="SAFETY", error_message="blocked")]),
          ("failed", "SAFETY")),
+        (lambda: llm_root([LlmResponse(
+            content=types.ModelContent(parts=[THOUGHT]),
+            error_code=types.FinishReason.MALFORMED_FUNCTION_CALL,
+        )]), ("failed", "MALFORMED_FUNCTION_CALL")),
         (lambda: llm_root(
             [calls("transfer_to_agent", agent_name="helper")],
             [LlmResponse(error_code="MALFORMED_FUNCTION_CALL", error_message="bad")],
         ), ("failed", "MALFORMED_FUNCTION_CALL")),
     ],
     ids=["reply", "tool then reply", "transfer", "sequential", "empty reply",
-         "client tool pause", "safety", "malformed call in a sub-agent"],
+         "client tool pause", "safety", "reasoning-only error response",
+         "malformed call in a sub-agent"],
 )
 async def test_runner_session(root, expected):
     assert state_and_code(invocation_outcome(await run_once(root()))) == expected
@@ -499,6 +575,21 @@ async def test_runner_session_after_an_exception_is_failed(steps):
 
     assert result.state == "failed"
     assert result.code in {"RuntimeError", INTERRUPTED_IN_TOOL, INTERRUPTED}
+
+
+@pytest.mark.asyncio
+async def test_runner_session_with_only_reasoning():
+    """ADK 2.x marks a STOP response with only reasoning as
+    ``MODEL_RETURNED_NO_CONTENT``; ADK 1.x treats it as the reply."""
+    result = invocation_outcome(await run_once(llm_root([LlmResponse(
+        content=types.ModelContent(parts=[THOUGHT]), finish_reason=types.FinishReason.STOP,
+    )])))
+
+    assert state_and_code(result) in {
+        ("failed", "MODEL_RETURNED_NO_CONTENT"), ("completed", None),
+    }
+    if int(google.adk.__version__.split(".")[0]) >= 2:
+        assert result.code == "MODEL_RETURNED_NO_CONTENT"
 
 
 @pytest.mark.asyncio

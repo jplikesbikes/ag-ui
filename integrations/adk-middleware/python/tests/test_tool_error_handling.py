@@ -33,6 +33,13 @@ def _seed_running_execution(middleware):
     return prior
 
 
+async def _wait_for_executions(middleware):
+    """Wait for the registered executions' tasks, which release their entries."""
+    tasks = {execution.task for execution in middleware._active_executions.values()}
+    if tasks:
+        await asyncio.wait(tasks)
+
+
 @contextmanager
 def _spy_background_start(middleware, prior):
     """Record, per background start, whether the seeded task had finished."""
@@ -152,8 +159,9 @@ class TestToolErrorHandling:
             assert events[1].type == EventType.RUN_FINISHED
 
         # The run waited for the seeded task before starting its own execution,
-        # and removed its execution from the key on finish.
+        # and its execution leaves the key when its task finishes.
         assert [st["prior_done"] for st in starts] == [True]
+        await _wait_for_executions(adk_middleware)
         assert adk_middleware._active_executions == {}
 
     @pytest.mark.asyncio
@@ -198,8 +206,9 @@ class TestToolErrorHandling:
             ] == [["nonexistent_call"]]
 
         # The run waited for the seeded task before starting its own execution,
-        # and removed its execution from the key on finish.
+        # and its execution leaves the key when its task finishes.
         assert [st["prior_done"] for st in starts] == [True]
+        await _wait_for_executions(adk_middleware)
         assert adk_middleware._active_executions == {}
 
     @pytest.mark.asyncio
@@ -309,8 +318,9 @@ class TestToolErrorHandling:
             assert events[1].type == EventType.RUN_FINISHED
 
         # The run waited for the seeded task before starting its own execution,
-        # and removed its execution from the key on finish.
+        # and its execution leaves the key when its task finishes.
         assert [st["prior_done"] for st in starts] == [True]
+        await _wait_for_executions(adk_middleware)
         assert adk_middleware._active_executions == {}
 
     @pytest.mark.asyncio
@@ -477,8 +487,9 @@ class TestToolErrorHandling:
             assert events[1].type == EventType.RUN_FINISHED
 
         # The run waited for the seeded task before starting its own execution,
-        # and removed its execution from the key on finish.
+        # and its execution leaves the key when its task finishes.
         assert [st["prior_done"] for st in starts] == [True]
+        await _wait_for_executions(adk_middleware)
         assert adk_middleware._active_executions == {}
 
     @pytest.mark.asyncio

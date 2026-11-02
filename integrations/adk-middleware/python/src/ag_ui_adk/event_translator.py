@@ -1739,6 +1739,45 @@ def _error_code_of(event: Any) -> Optional[str]:
     return code if isinstance(code, str) and code else None
 
 
+#: The error codes that mark a model response as failed even when it has parts
+#: (reasoning, blank or partial text): google.genai's finish and block reasons
+#: other than a normal stop and a truncated answer (``MAX_TOKENS``,
+#: ``CONTINUATION``: the parts are the answer, cut short), and ADK 2.x's
+#: ``MODEL_RETURNED_NO_CONTENT``. A code outside this set on a response with
+#: parts (a provider- or mock-specific finish reason) leaves the parts as the
+#: answer.
+_FAILED_RESPONSE_CODES = frozenset({
+    # types.FinishReason
+    "SAFETY", "RECITATION", "LANGUAGE", "OTHER", "BLOCKLIST",
+    "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "IMAGE_SAFETY",
+    "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS", "IMAGE_PROHIBITED_CONTENT",
+    "NO_IMAGE", "IMAGE_RECITATION", "IMAGE_OTHER",
+    # types.BlockedReason
+    "MODEL_ARMOR", "JAILBREAK",
+    # ADK 2.x: a STOP response with nothing but reasoning or blank text
+    "MODEL_RETURNED_NO_CONTENT",
+})
+
+
+def _failure_code_of(event: Any) -> Optional[str]:
+    """The ``error_code`` of an event that records a failure, or None.
+
+    That is an error event without content (an error response, a node or
+    tool failure on ADK 2.x), a model response with one of
+    ``_FAILED_RESPONSE_CODES`` whatever parts it holds, or an event that
+    answers calls and carries an ``error_code`` (a seal, such as ADK's abort
+    seal).
+    """
+    code = _error_code_of(event)
+    if not code:
+        return None
+    if not _has_parts(event) or code in _FAILED_RESPONSE_CODES:
+        return code
+    if event.get_function_responses():
+        return code
+    return None
+
+
 def _is_significant(event: Any) -> bool:
     """Content or an error: not a bare lifecycle marker or a streaming chunk."""
     if _error_code_of(event):
@@ -1809,12 +1848,15 @@ def invocation_outcome(
 
         - ``working`` while ``live``;
         - ``input-required`` while a long-running call (a client tool, an
-          ``adk_request_confirmation``) or a predictive-state review waits for
-          its answer;
+          ``adk_request_confirmation``) waits for its answer, or a
+          predictive-state review does after a completed invocation;
         - ``canceled`` when ADK sealed it as aborted;
-        - ``failed`` when its last event is an ADK error response, an
-          ``error_code`` without content (``code`` is the ``error_code``),
-          even if an ``end_of_agent`` follows it; when it stopped
+        - ``failed`` when its last event records an error, even if an
+          ``end_of_agent`` follows it (``code`` is the ``error_code``): an
+          error without content, a model response with a failure
+          ``error_code`` whatever reasoning or text it also holds (not
+          ``MAX_TOKENS``, a truncated answer), or a seal answering calls with
+          errors; when it stopped
           without completing, with a call it made left without a response
           (``INTERRUPTED_IN_TOOL``) or not (``INTERRUPTED``);
         - ``completed`` otherwise, with ``code`` ``EMPTY_REPLY`` when no agent
@@ -1849,20 +1891,15 @@ def invocation_outcome(
         for event in events
         for tool_id in getattr(event, "long_running_tool_ids", None) or ()
     }
-    state = getattr(session, "state", None) or {}
-    if any(call_id in long_running for call_id in open_calls) or state.get(
-        PENDING_CONFIRM_CHANGES_STATE_KEY
-    ):
+    if any(call_id in long_running for call_id in open_calls):
         return outcome("input-required")
 
     significant = [event for event in events if _is_significant(event)]
     last = significant[-1] if significant else None
-    error_code = _error_code_of(last)
+    error_code = _failure_code_of(last)
     if error_code == INVOCATION_ABORTED:
         return outcome("canceled", INVOCATION_ABORTED)
-    # ADK also copies a non-STOP finish_reason (MAX_TOKENS, ...) onto a
-    # response that has content; that response is the answer, not an error.
-    if error_code and not _has_parts(last):
+    if error_code:
         return outcome("failed", error_code)
 
     agent_spoke = last is not None and last.author != "user"
@@ -1878,18 +1915,22 @@ def invocation_outcome(
     # step its caller recovered from (a nested agent's tool that raised): the
     # run still completed.
     if closed:
+        # A predictive-state review is answered by the client after the
+        # invocation that proposed it completed; a later failure is reported
+        # as the failure, not hidden behind the review.
+        state = getattr(session, "state", None) or {}
+        if state.get(PENDING_CONFIRM_CHANGES_STATE_KEY):
+            return outcome("input-required")
         return outcome("completed", None if agent_spoke else EMPTY_REPLY)
     if open_calls:
         return outcome("failed", INTERRUPTED_IN_TOOL)
     return outcome("failed", INTERRUPTED)
 
 
-#: The message ADK's abort seal answers a dangling call with.
-INVOCATION_ABORTED_MESSAGE = "Invocation was aborted by client."
-
-
-def unanswered_call_seals(events: List[Any], invocation_id: str) -> List[ADKEvent]:
-    """Events that close an invocation's unanswered function calls.
+def unanswered_call_seals(
+    events: List[Any], invocation_id: str, error_code: str
+) -> List[ADKEvent]:
+    """Events that close a failed invocation's unanswered function calls.
 
     Each call the invocation made without a response, other than a
     long-running one (a client tool or confirmation still waiting for its
@@ -1899,13 +1940,16 @@ def unanswered_call_seals(events: List[Any], invocation_id: str) -> List[ADKEven
     turn"); ADK 2.x instead drops the orphaned call, and the model never
     learns the tool was called.
 
-    The shape is ADK's own abort seal (``google.adk.events._abort_events.
-    _build_abort_events``, ADK >= 2.x; private, so mirrored here with public
-    types): one event per (author, branch, isolation scope) of the calls'
-    events, authored by the agent that issued them, with the original
-    ``invocation_id``, ``error_code`` ``INVOCATION_ABORTED`` and
-    ``{"error": "Invocation was aborted by client."}`` responses. ADK reads
-    such a call as aborted rather than replaying it.
+    The seal records the failure that left the calls open, ``error_code``
+    (the invocation's failed outcome code: an exception class name such as
+    ``RuntimeError`` on ADK 2.x, or ``INTERRUPTED_IN_TOOL``): each response is
+    ``{"error": error_code}`` and each event carries that ``error_code``, so
+    ``invocation_outcome`` still reads the invocation as failed with it. No
+    exception text is written; the model sees only that the call failed. The
+    events follow the layout of ADK's own seal of an aborted invocation: one
+    per (author, branch, isolation scope) of the calls' events, authored by the
+    agent that issued them, with the original ``invocation_id``. A sealed call
+    is answered, so ADK does not run it again.
     """
     invocation_events = [e for e in events if e.invocation_id == invocation_id]
     answered = {
@@ -1943,14 +1987,13 @@ def unanswered_call_seals(events: List[Any], invocation_id: str) -> List[ADKEven
                             function_response=types.FunctionResponse(
                                 id=call.id,
                                 name=call.name,
-                                response={"error": INVOCATION_ABORTED_MESSAGE},
+                                response={"error": error_code},
                             )
                         )
                         for call in calls
                     ],
                 ),
-                error_code=INVOCATION_ABORTED,
-                error_message=INVOCATION_ABORTED_MESSAGE,
+                error_code=error_code,
                 **extra,
             )
         )

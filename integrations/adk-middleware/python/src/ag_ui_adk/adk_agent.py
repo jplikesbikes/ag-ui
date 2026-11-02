@@ -450,6 +450,7 @@ class ADKAgent:
 
         # Retrying a failed run
         resume_failed_invocations: bool = False,
+
         # Client disconnects
         abort_on_client_disconnect: bool = False,
     ):
@@ -581,15 +582,19 @@ class ADKAgent:
                 mid-turn. ADK continues it with
                 ``Runner.run_async(invocation_id=..., new_message=None)``: a call
                 left without a response by a dead process is executed again,
-                a call whose tool raised is first closed as aborted (so the
-                model sees it failed and the tool is not re-run), and otherwise
-                the model is called again. Delivery is at least once: a tool
+                a call whose tool raised is first sealed with the failure (so
+                the model sees it failed and the tool is not re-run), and
+                otherwise the model is called again. Delivery is at least once: a tool
                 that was running when the process died runs again, so tools
                 with side effects must tolerate a repeat. A completed, canceled,
                 paused or running invocation is never resumed (resuming a
                 completed one would repeat its turn); such a run still ends in
-                an empty ``RUN_STARTED`` / ``RUN_FINISHED``. Requires an ADK
-                resumable app (``from_app()`` with
+                an empty ``RUN_STARTED`` / ``RUN_FINISHED``. The decision waits
+                for any run of the thread still executing on this instance.
+                Liveness is per process: run a single instance or route a
+                thread's requests to one instance, or a retry served by
+                another instance can resume an invocation that still runs.
+                Requires an ADK resumable app (``from_app()`` with
                 ``ResumabilityConfig(is_resumable=True)``); ignored otherwise.
                 Defaults to False.
             abort_on_client_disconnect: When True, a run whose client stops
@@ -1088,56 +1093,52 @@ class ADKAgent:
         task = getattr(execution, "task", None)
         return task is None or not task.done()
 
-    async def _resume_failed_invocation(
-        self, input: RunAgentInput, user_id: str, app_name: str
-    ) -> AsyncGenerator[BaseEvent, None]:
-        """Resume the thread's latest invocation if it failed; yield nothing otherwise.
+    async def _failed_invocation_to_resume(
+        self, thread_id: str, app_name: str, user_id: str
+    ) -> Optional[str]:
+        """Prepare the thread's latest invocation for a resume, if it failed.
 
-        Called for a run that brings no new message (a retry). Only a
+        Called by a retry's background execution (``resume_failed_invocations``)
+        once it holds the thread: any earlier execution of the thread on this
+        instance has finished, so the outcome read here is final, and a second
+        retry waiting behind this one reads what this one did. Only a
         ``failed`` invocation is resumed: ADK re-runs a completed one as a new
-        turn, and a paused, canceled or running one is not this run's to
-        continue. A call whose tool raised is first closed in ADK's abort-seal
-        shape, so ADK continues to the model, which sees the call failed,
-        instead of treating the invocation as done; a call left open by a dead
-        process is not closed, so ADK executes it again (at least once).
+        turn, and a paused or canceled one is not this run's to continue. A
+        call whose tool raised is first sealed with the failure
+        (``unanswered_call_seals``), so ADK continues to the model, which sees
+        the call failed, instead of treating the invocation as done; a call
+        left open by a dead process is not sealed, so ADK executes it again
+        (at least once).
+
+        Returns:
+            The invocation id to resume, or None when there is nothing to
+            resume.
         """
         try:
             session = await self._session_manager.resolve_existing_session(
-                input.thread_id, app_name, user_id
+                thread_id, app_name, user_id
             )
-        except Exception:
-            _log_session_lookup_failure(input.thread_id, app_name, user_id)
-            yield RunStartedEvent(
-                type=EventType.RUN_STARTED,
-                thread_id=input.thread_id,
-                run_id=input.run_id,
-                protocol_version=PROTOCOL_VERSION,
-            )
-            yield _session_lookup_error_event()
-            return
+        except Exception as e:
+            _log_session_lookup_failure(thread_id, app_name, user_id)
+            raise _SessionLookupError() from e
         if session is None:
-            return
-        outcome = invocation_outcome(
-            session,
-            live=self._has_live_execution(input.thread_id, user_id, app_name=app_name),
-        )
+            return None
+        outcome = invocation_outcome(session)
         if outcome is None or outcome.state != "failed" or not outcome.invocation_id:
-            return
+            return None
         if outcome.code not in (INTERRUPTED_IN_TOOL, INTERRUPTED):
             # The invocation recorded an error: a call it left open raised.
-            seals = unanswered_call_seals(session.events, outcome.invocation_id)
+            # Idempotent: a call sealed by an earlier attempt is answered.
+            seals = unanswered_call_seals(session.events, outcome.invocation_id, outcome.code)
             for seal in seals:
                 await self._session_manager._session_service.append_event(session, seal)
             if seals:
                 self._session_manager.invalidate_session(session.id, app_name, user_id)
         logger.info(
             "Resuming failed invocation %s (%s) of thread %s",
-            outcome.invocation_id, outcome.code, input.thread_id,
+            outcome.invocation_id, outcome.code, thread_id,
         )
-        async for event in self._start_new_execution(
-            input, message_batch=[], failed_invocation_id=outcome.invocation_id
-        ):
-            yield event
+        return outcome.invocation_id
 
     async def _seal_failed_invocation(
         self, session: Any, backend_session_id: str, app_name: str, user_id: str
@@ -1148,13 +1149,13 @@ class ADKAgent:
         without a response. A new message would then reach the model after a
         call with no answer, which model APIs reject (ADK 1.x) or which ADK
         drops from the request (ADK 2.x), so the model never learns the call
-        failed. Only a ``failed`` invocation is sealed; a call waiting for the
-        user (``input-required``) is left open.
+        failed. Only a ``failed`` invocation is sealed, with its outcome code;
+        a call waiting for the user (``input-required``) is left open.
         """
         outcome = invocation_outcome(session, resumable=self._is_adk_resumable())
         if outcome is None or outcome.state != "failed" or not outcome.invocation_id:
             return
-        seals = unanswered_call_seals(session.events, outcome.invocation_id)
+        seals = unanswered_call_seals(session.events, outcome.invocation_id, outcome.code)
         if not seals:
             return
         logger.info(
@@ -1828,12 +1829,15 @@ class ADKAgent:
             return
 
         if not unseen_messages and self._resume_failed_invocations and self._is_adk_resumable():
-            resumed = False
-            async for event in self._resume_failed_invocation(input, user_id, app_name):
-                resumed = True
+            # A retry: its execution resumes the latest invocation if it
+            # failed, and otherwise ends with nothing to do. The decision is
+            # made once the execution holds the thread, after any run still
+            # executing there has ended.
+            async for event in self._start_new_execution(
+                input, message_batch=[], resume_failed_invocation=True
+            ):
                 yield event
-            if resumed:
-                return
+            return
 
         if not unseen_messages:
             # Nothing new to act on. Terminate cleanly rather than starting an execution:
@@ -3571,8 +3575,10 @@ class ADKAgent:
                 logger.debug(f"Got event #{event_count} from queue: {type(event).__name__ if event else 'None'} (thread {execution.thread_id})")
 
                 if event is None:
-                    # Execution complete
-                    execution.is_complete = True
+                    # The producer signalled completion. Let its task finish
+                    # (runner close, bookkeeping) so the run's stream ends
+                    # with the execution, not before it.
+                    await asyncio.wait({execution.task})
                     logger.debug(f"Execution complete for thread {execution.thread_id} after {event_count} events")
                     break
                 
@@ -3596,7 +3602,6 @@ class ADKAgent:
                 # Check if task is done
                 if execution.task.done():
                     # Task completed but didn't send None
-                    execution.is_complete = True
                     try:
                         task_result = execution.task.result()
                         logger.debug(f"Task completed with result: {task_result} (thread {execution.thread_id})")
@@ -3620,7 +3625,7 @@ class ADKAgent:
         message_batch: Optional[List[Any]] = None,
         on_accepted: Optional[Callable[[], Awaitable[None]]] = None,
         history_seed: Optional[List[Any]] = None,
-        failed_invocation_id: Optional[str] = None,
+        resume_failed_invocation: bool = False,
     ) -> AsyncGenerator[BaseEvent, None]:
         """Start a new ADK execution with tool support.
 
@@ -3659,46 +3664,62 @@ class ADKAgent:
                 protocol_version=PROTOCOL_VERSION,
             )
             
-            # Check concurrent execution limit
-            async with self._execution_lock:
-                if len(self._active_executions) >= self._max_concurrent:
-                    # Clean up stale executions
-                    await self._cleanup_stale_executions()
-                    
-                    if len(self._active_executions) >= self._max_concurrent:
-                        raise RuntimeError(
-                            f"Maximum concurrent executions ({self._max_concurrent}) reached"
-                        )
-                
-                # Check if there's an existing execution for this thread+user and wait for it
-                existing_execution = self._active_executions.get(exec_key)
+            # Admission: the check for a running execution of this thread
+            # and the registration of this one happen in one hold of the
+            # lock, so of two runs arriving together the second always waits
+            # for the first. An execution stays registered until its task
+            # finishes, even when its client stopped reading.
+            while True:
+                async with self._execution_lock:
+                    existing_execution = self._active_executions.get(exec_key)
+                    if (
+                        existing_execution is not None
+                        and not existing_execution.is_complete
+                        and existing_execution.is_stale(self._execution_timeout)
+                    ):
+                        # Past execution_timeout_seconds: cancelled, not waited on.
+                        await self._cleanup_stale_executions()
+                        existing_execution = self._active_executions.get(exec_key)
+                    if existing_execution is None or existing_execution.is_complete:
+                        # Check concurrent execution limit
+                        if len(self._active_executions) >= self._max_concurrent:
+                            # Clean up stale executions
+                            await self._cleanup_stale_executions()
 
-            # If there was an existing execution, wait for it to complete
-            if existing_execution and not existing_execution.is_complete:
+                            if len(self._active_executions) >= self._max_concurrent:
+                                raise RuntimeError(
+                                    f"Maximum concurrent executions ({self._max_concurrent}) reached"
+                                )
+
+                        # Start background execution and store it (replacing
+                        # any previous, finished one)
+                        execution = await self._start_background_execution(
+                            input,
+                            tool_results=tool_results,
+                            message_batch=message_batch,
+                            **({"on_accepted": on_accepted} if on_accepted is not None else {}),
+                            **({"history_seed": history_seed} if history_seed else {}),
+                            **(
+                                {"resume_failed_invocation": True}
+                                if resume_failed_invocation
+                                else {}
+                            ),
+                        )
+                        self._active_executions[exec_key] = execution
+                        break
+
+                # Wait for the existing execution outside the lock, at most
+                # until it is stale, then check again. asyncio.wait, unlike
+                # awaiting the task, does not cancel it if this run's client
+                # goes away meanwhile.
                 logger.debug(f"Waiting for existing execution to complete for thread {input.thread_id}")
-                try:
-                    await existing_execution.task
-                except Exception as e:
-                    logger.debug(f"Previous execution completed with error: {e}")
-            
-            # Start background execution
-            execution = await self._start_background_execution(
-                input,
-                tool_results=tool_results,
-                message_batch=message_batch,
-                **({"on_accepted": on_accepted} if on_accepted is not None else {}),
-                **({"history_seed": history_seed} if history_seed else {}),
-                **(
-                    {"failed_invocation_id": failed_invocation_id}
-                    if failed_invocation_id
-                    else {}
-                ),
-            )
-            
-            # Store execution (replacing any previous one)
-            async with self._execution_lock:
-                self._active_executions[exec_key] = execution
-            
+                await asyncio.wait(
+                    {existing_execution.task},
+                    timeout=max(
+                        0.0, self._execution_timeout - existing_execution.get_execution_time()
+                    ),
+                )
+
             # Stream events and track tool calls
             logger.debug(f"Starting to stream events for execution {execution.thread_id}")
             app_name = self._get_app_name(input)
@@ -3794,16 +3815,9 @@ class ADKAgent:
                 # through SessionManager, so the parent context's pre-run read
                 # cache is stale by the time this cleanup guard runs.
                 self._session_manager.disable_session_read_cache()
-                # Clean up execution if complete and no pending tool calls (HITL scenarios)
-                async with self._execution_lock:
-                    if exec_key in self._active_executions:
-                        execution = self._active_executions[exec_key]
-                        execution.is_complete = True
-
-                        # Check if session has pending tool calls before cleanup
-                        has_pending = await self._has_pending_tool_calls(input.thread_id, user_id, app_name=app_name)
-                        if not has_pending:
-                            del self._active_executions[exec_key]
+                # The execution is not released here: a client that stopped
+                # reading leaves its task running, and the task releases the
+                # execution when it finishes (_release_execution).
             finally:
                 self._session_manager.stop_session_read_cache(session_cache_token)
     
@@ -3894,7 +3908,7 @@ class ADKAgent:
         message_batch: Optional[List[Any]] = None,
         on_accepted: Optional[Callable[[], Awaitable[None]]] = None,
         history_seed: Optional[List[Any]] = None,
-        failed_invocation_id: Optional[str] = None,
+        resume_failed_invocation: bool = False,
     ) -> ExecutionState:
         """Start ADK execution in background with tool support.
 
@@ -4163,13 +4177,16 @@ class ADKAgent:
         if history_seed:
             run_kwargs["history_seed"] = history_seed
 
-        if failed_invocation_id:
-            run_kwargs["failed_invocation_id"] = failed_invocation_id
+        if resume_failed_invocation:
+            run_kwargs["resume_failed_invocation"] = True
+
         abort_signal = asyncio.Event() if self._abort_on_client_disconnect else None
         if abort_signal is not None:
             run_kwargs["abort_signal"] = abort_signal
 
-        task = asyncio.create_task(self._run_adk_in_background(**run_kwargs))
+        task = asyncio.create_task(
+            self._run_execution((input.thread_id, user_id, app_name), run_kwargs)
+        )
         logger.debug(f"Background task created for thread {input.thread_id}: {task}")
 
         return ExecutionState(
@@ -4181,6 +4198,40 @@ class ADKAgent:
             abort_signal=abort_signal,
         )
     
+    async def _run_execution(
+        self, exec_key: Tuple[str, str, str], run_kwargs: Dict[str, Any]
+    ) -> None:
+        """The background task of an execution: the ADK run, then its release."""
+        try:
+            await self._run_adk_in_background(**run_kwargs)
+        finally:
+            await self._release_execution(exec_key)
+
+    async def _release_execution(self, exec_key: Tuple[str, str, str]) -> None:
+        """Remove the calling task's execution from ``_active_executions``.
+
+        Runs as the task's last step, so the execution is registered for as
+        long as its task runs, whether or not a client still reads its
+        stream. An execution whose run paused on pending tool calls (HITL) is
+        kept, complete, until the next run of the thread replaces it. Runs
+        without ``_execution_lock``: ``close()`` and the stale-execution
+        cleanup hold it while they await a cancelled task, which ends here.
+        """
+        execution = self._active_executions.get(exec_key)
+        if execution is None or execution.task is not asyncio.current_task():
+            return
+        # The ADK runner can mutate session state without going through
+        # SessionManager, so a read cache from before the run is stale.
+        self._session_manager.disable_session_read_cache()
+        thread_id, user_id, app_name = exec_key
+        try:
+            has_pending = await self._has_pending_tool_calls(thread_id, user_id, app_name=app_name)
+        except Exception as e:
+            logger.warning(f"Could not read pending tool calls of thread {thread_id}: {e}")
+            has_pending = False
+        if not has_pending and self._active_executions.get(exec_key) is execution:
+            del self._active_executions[exec_key]
+
     async def _run_adk_in_background(
         self,
         input: RunAgentInput,
@@ -4194,7 +4245,7 @@ class ADKAgent:
         message_batch: Optional[List[Any]] = None,
         on_accepted: Optional[Callable[[], Awaitable[None]]] = None,
         history_seed: Optional[List[Any]] = None,
-        failed_invocation_id: Optional[str] = None,
+        resume_failed_invocation: bool = False,
         abort_signal: Optional[asyncio.Event] = None,
     ):
         """Run ADK agent in background, emitting events to queue.
@@ -4213,6 +4264,9 @@ class ADKAgent:
             on_accepted: Consumes the answer this run continues (see
                 ``_start_new_execution``). Awaited only after the session read
                 succeeds, so a failed lookup leaves the answer retryable.
+            resume_failed_invocation: A retry (``resume_failed_invocations``):
+                resume the thread's latest invocation if it failed, or end
+                without running anything.
             abort_signal: Passed to ``Runner.run_async`` (see
                 ``abort_on_client_disconnect``); set, ADK aborts the invocation.
         """
@@ -4235,7 +4289,16 @@ class ADKAgent:
         pending_lro_id_remap: Dict[str, str] = {}
         logger.debug(f"[BG_EXEC] _run_adk_in_background called for thread={input.thread_id}")
         logger.debug(f"[BG_EXEC]   tool_results={len(tool_results) if tool_results else 0}, message_batch={len(message_batch) if message_batch else 0}")
+        failed_invocation_id: Optional[str] = None
         try:
+            if resume_failed_invocation:
+                failed_invocation_id = await self._failed_invocation_to_resume(
+                    input.thread_id, app_name, user_id
+                )
+                if failed_invocation_id is None:
+                    await event_queue.put(None)
+                    return
+
             # Agent is already prepared with tools and SystemMessage instructions (if any)
             # from _start_background_execution, so no additional agent copying needed here
 
@@ -5238,7 +5301,10 @@ class ADKAgent:
                 stale_keys.append(exec_key)
 
         for exec_key in stale_keys:
-            execution = self._active_executions.pop(exec_key)
+            # A task that finished meanwhile released its own entry.
+            execution = self._active_executions.pop(exec_key, None)
+            if execution is None:
+                continue
             await execution.cancel()
             thread_id, _uid, _app = exec_key
             logger.info(f"Cleaned up stale execution for thread {thread_id}")
@@ -5247,7 +5313,9 @@ class ADKAgent:
         """Clean up resources including active executions."""
         # Cancel all active executions
         async with self._execution_lock:
-            for execution in self._active_executions.values():
+            # A cancelled task releases its own entry as it ends, so iterate
+            # over a copy.
+            for execution in list(self._active_executions.values()):
                 await execution.cancel()
             self._active_executions.clear()
 

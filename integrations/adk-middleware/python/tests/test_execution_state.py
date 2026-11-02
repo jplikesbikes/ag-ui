@@ -98,17 +98,12 @@ class TestExecutionState:
         assert execution_time >= 0
         assert execution_time < 1.0  # Should be very small for fresh execution
 
-    def test_get_status_complete(self, execution_state):
-        """Test get_status when execution is complete."""
-        execution_state.is_complete = True
-
-        assert execution_state.get_status() == "complete"
-
-    def test_get_status_task_done(self, execution_state, mock_task):
-        """Test get_status when task is done but execution not marked complete."""
+    def test_get_status_complete(self, execution_state, mock_task):
+        """Test get_status when the task has finished."""
         mock_task.done.return_value = True
 
-        assert execution_state.get_status() == "task_done"
+        assert execution_state.is_complete is True
+        assert execution_state.get_status() == "complete"
 
     def test_get_status_running(self, execution_state):
         """Test get_status when execution is running normally."""

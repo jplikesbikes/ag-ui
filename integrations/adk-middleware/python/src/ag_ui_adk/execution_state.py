@@ -17,6 +17,10 @@ class ExecutionState:
     - The background asyncio task running the ADK agent
     - Event queue for streaming results to the client
     - Execution timing and completion state
+
+    The execution lasts as long as its task, not as long as a client reads
+    its event queue: a client that stops reading (an aborted run, an
+    ``EXECUTION_TIMEOUT``) leaves the task running.
     """
 
     def __init__(
@@ -51,7 +55,6 @@ class ExecutionState:
         self.thread_id = thread_id
         self.event_queue = event_queue
         self.start_time = time.time()
-        self.is_complete = False
         self.pending_tool_calls: Set[str] = set()  # Track outstanding tool call IDs for HITL
         self.long_running_tool_ids: Set[str] = (
             long_running_tool_ids if long_running_tool_ids is not None else set()
@@ -60,6 +63,11 @@ class ExecutionState:
         self.abort_signal = abort_signal
 
         logger.debug(f"Created execution state for thread {thread_id}")
+
+    @property
+    def is_complete(self) -> bool:
+        """Whether the background task has finished."""
+        return self.task.done()
 
     def is_stale(self, timeout_seconds: int) -> bool:
         """Check if this execution has been running too long.
@@ -83,8 +91,6 @@ class ExecutionState:
                 await self.task
             except asyncio.CancelledError:
                 pass
-
-        self.is_complete = True
 
     def get_execution_time(self) -> float:
         """Get the total execution time in seconds.
@@ -131,8 +137,6 @@ class ExecutionState:
                 return "complete_awaiting_tools"
             else:
                 return "complete"
-        elif self.task.done():
-            return "task_done"
         else:
             return "running"
 
