@@ -160,6 +160,25 @@ def _session_lookup_error_event() -> RunErrorEvent:
 # that is a cancellation, not an error.
 _INVOCATION_ABORTED = "INVOCATION_ABORTED"
 
+# The error codes that mark a model response as failed even when it has parts
+# (reasoning, blank or partial text): google.genai's finish and block reasons
+# other than a normal stop and a truncated answer (``MAX_TOKENS``,
+# ``CONTINUATION``: the parts are the answer, cut short), and ADK 2.x's
+# ``MODEL_RETURNED_NO_CONTENT``. A response without parts fails on any code.
+# A code outside this set on a response with parts (a provider- or
+# mock-specific finish reason) leaves the parts as the answer.
+_FAILED_RESPONSE_CODES = frozenset({
+    # types.FinishReason
+    "SAFETY", "RECITATION", "LANGUAGE", "OTHER", "BLOCKLIST",
+    "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "IMAGE_SAFETY",
+    "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS", "IMAGE_PROHIBITED_CONTENT",
+    "NO_IMAGE", "IMAGE_RECITATION", "IMAGE_OTHER",
+    # types.BlockedReason
+    "MODEL_ARMOR", "JAILBREAK",
+    # ADK 2.x: a STOP response with nothing but reasoning or blank text
+    "MODEL_RETURNED_NO_CONTENT",
+})
+
 
 def _error_code_of(adk_event: Any) -> Optional[str]:
     """An ADK event's ``error_code`` as a plain string, or None.
@@ -4707,21 +4726,26 @@ class ADKAgent:
                 event_partial = getattr(adk_event, 'partial', False)
                 event_turn_complete = getattr(adk_event, 'turn_complete', None)
 
-                # An error response is an error_code without content. ADK also
-                # copies a non-STOP finish_reason (MAX_TOKENS, ...) onto a
-                # response that has content; that response is the answer.
-                # Content after an error response means the run recovered;
-                # bare lifecycle markers (end_of_agent) don't count.
+                # An error response is an error_code without content, or one
+                # of _FAILED_RESPONSE_CODES whatever parts the response holds
+                # (reasoning, blank or partial text). ADK also copies MAX_TOKENS
+                # onto a response that has content; that response is the
+                # answer. Content after an error response means the run
+                # recovered; bare lifecycle markers (end_of_agent) don't count.
                 if not event_partial:
-                    if adk_event.content and getattr(adk_event.content, 'parts', None):
+                    event_error_code = _error_code_of(adk_event)
+                    has_content = bool(
+                        adk_event.content and getattr(adk_event.content, 'parts', None)
+                    )
+                    if event_error_code and (
+                        not has_content or event_error_code in _FAILED_RESPONSE_CODES
+                    ):
+                        model_error_code = (
+                            None if event_error_code == _INVOCATION_ABORTED
+                            else event_error_code
+                        )
+                    elif has_content:
                         model_error_code = None
-                    else:
-                        event_error_code = _error_code_of(adk_event)
-                        if event_error_code:
-                            model_error_code = (
-                                None if event_error_code == _INVOCATION_ABORTED
-                                else event_error_code
-                            )
 
                 # Log which agent is producing events
                 content_preview = ""

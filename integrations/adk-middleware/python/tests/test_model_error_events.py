@@ -11,6 +11,7 @@ fixed text (ADK's ``error_message`` can carry provider detail).
 
 from typing import Any, List
 
+import google.adk
 import pytest
 
 from ag_ui.core import EventType, RunAgentInput, UserMessage
@@ -200,3 +201,66 @@ async def test_a_finish_reason_enum_becomes_its_name():
     ))
 
     assert terminal(events).code == "SAFETY"
+
+
+THOUGHT = types.Part(text="thinking it over", thought=True)
+
+
+def response(*parts: types.Part, **fields: Any) -> LlmResponse:
+    return LlmResponse(content=types.ModelContent(parts=list(parts)), **fields)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "step, code",
+    [
+        (response(THOUGHT, error_code=types.FinishReason.MALFORMED_FUNCTION_CALL),
+         "MALFORMED_FUNCTION_CALL"),
+        (response(types.Part(text=" \n"), error_code="SAFETY"), "SAFETY"),
+        (response(THOUGHT, error_code="MODEL_RETURNED_NO_CONTENT"), "MODEL_RETURNED_NO_CONTENT"),
+        # Streaming, ADK aggregates the text it got before the model stopped
+        # onto the final response, with the finish reason as its error_code.
+        (response(types.Part(text="Hel"), error_code="SAFETY"), "SAFETY"),
+    ],
+    ids=["reasoning only", "blank text", "no content", "partial text, blocked"],
+)
+async def test_an_error_response_ends_in_run_error_whatever_parts_it_has(step, code):
+    """An ``error_code`` other than a truncated answer's is the model failing,
+    whatever reasoning or text came with it."""
+    events = await run(agent_for(llm_root([step]), resumable=True))
+
+    end = terminal(events)
+    assert (end.type, end.code) == (EventType.RUN_ERROR, code)
+
+
+@pytest.mark.asyncio
+async def test_an_answer_with_reasoning_cut_at_max_tokens_finishes():
+    step = response(THOUGHT, types.Part(text="a long answer, cut"), error_code="MAX_TOKENS")
+
+    events = await run(agent_for(llm_root([step]), resumable=True))
+
+    assert terminal(events).type == EventType.RUN_FINISHED
+
+
+@pytest.mark.asyncio
+async def test_a_reasoning_only_stop_response():
+    """ADK 2.x marks it ``MODEL_RETURNED_NO_CONTENT``; ADK 1.x ends the turn."""
+    step = response(THOUGHT, finish_reason=types.FinishReason.STOP)
+
+    end = terminal(await run(agent_for(llm_root([step]), resumable=True)))
+
+    if int(google.adk.__version__.split(".")[0]) >= 2:
+        assert (end.type, end.code) == (EventType.RUN_ERROR, "MODEL_RETURNED_NO_CONTENT")
+    else:
+        assert end.type == EventType.RUN_FINISHED
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_code_on_a_response_with_content_is_not_an_error():
+    """A finish reason google.genai does not define (a provider's or a mock's)
+    is not read as a failure when the response has content."""
+    step = response(types.Part(text="the answer"), error_code="FUNCTION_CALL")
+
+    events = await run(agent_for(llm_root([step]), resumable=True))
+
+    assert terminal(events).type == EventType.RUN_FINISHED
