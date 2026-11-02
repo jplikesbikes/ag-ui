@@ -47,6 +47,12 @@ from google.adk.agents import BaseAgent, LlmAgent, RunConfig as ADKRunConfig
 # minimal placeholder that short-circuits _resolve_invocation_id.
 _ADK_OVERRIDES_INVOCATION_ID = hasattr(Runner, "_resolve_invocation_id")
 
+# Feature detect ``Runner.run_async(abort_signal=...)`` (google-adk 2.x). Set,
+# the event makes ADK end the invocation and seal its open calls as
+# ``INVOCATION_ABORTED``. Absent on 1.x, so abort_on_client_disconnect has no
+# effect there.
+_ADK_SUPPORTS_ABORT_SIGNAL = "abort_signal" in inspect.signature(Runner.run_async).parameters
+
 # Feature detect ADK's guard for plugins a Runner does not own.
 #
 # PluginManager.set_skip_closing_plugins() was added in google-adk 2.2.0 and is
@@ -444,6 +450,8 @@ class ADKAgent:
 
         # Retrying a failed run
         resume_failed_invocations: bool = False,
+        # Client disconnects
+        abort_on_client_disconnect: bool = False,
     ):
         """Initialize the ADKAgent.
 
@@ -584,6 +592,18 @@ class ADKAgent:
                 resumable app (``from_app()`` with
                 ``ResumabilityConfig(is_resumable=True)``); ignored otherwise.
                 Defaults to False.
+            abort_on_client_disconnect: When True, a run whose client stops
+                reading its event stream before the run ends (the client
+                aborts the run or disconnects, or the stream ends on
+                ``EXECUTION_TIMEOUT``) aborts its ADK invocation through
+                ``Runner.run_async(abort_signal=...)``: ADK stops the running
+                tool or model call, calls nothing further, and seals the
+                invocation's open calls with ``error_code``
+                ``INVOCATION_ABORTED``. A dropped connection then ends the turn
+                as well, not only a deliberate stop. When False (the default),
+                ADK runs the invocation to its end after the client leaves.
+                Requires google-adk 2.x; on 1.x it has no effect and a warning
+                is logged.
 
             Note:
             If delete_session_on_cleanup=False but save_session_to_memory_on_cleanup=True, sessions will accumulate in SessionService but still be saved to memory on cleanup.
@@ -719,6 +739,16 @@ class ADKAgent:
         self._seed_first_run_history = seed_first_run_history
         # Resume a failed invocation on a run with nothing new (see docstring).
         self._resume_failed_invocations = resume_failed_invocations
+        # Abort the ADK invocation when its client stops reading (see docstring).
+        if abort_on_client_disconnect and not _ADK_SUPPORTS_ABORT_SIGNAL:
+            logger.warning(
+                "abort_on_client_disconnect=True needs Runner.run_async(abort_signal=...) "
+                "(google-adk 2.x); the installed google-adk lacks it, so runs continue "
+                "after their client disconnects."
+            )
+        self._abort_on_client_disconnect = (
+            abort_on_client_disconnect and _ADK_SUPPORTS_ABORT_SIGNAL
+        )
 
         # Streaming function call arguments (Gemini 3+ via Vertex AI)
         if streaming_function_call_arguments and not self._adk_supports_streaming_fc_args():
@@ -917,6 +947,8 @@ class ADKAgent:
         # First-run history
         seed_first_run_history: bool = True,
         resume_failed_invocations: bool = False,
+        # Client disconnects
+        abort_on_client_disconnect: bool = False,
     ) -> "ADKAgent":
         """Create ADKAgent from an ADK App instance.
 
@@ -973,6 +1005,9 @@ class ADKAgent:
             resume_failed_invocations: Resume the thread's latest invocation
                 when it failed and a run brings no new message (a retry).
                 Defaults to False; at-least-once, see ADKAgent.__init__.
+            abort_on_client_disconnect: Abort the ADK invocation when its
+                client stops reading the run's stream. Defaults to False; see
+                ADKAgent.__init__ (google-adk 2.x).
 
         Returns:
             ADKAgent instance configured to use the App
@@ -1024,6 +1059,7 @@ class ADKAgent:
             emit_interrupt_outcome=emit_interrupt_outcome,
             seed_first_run_history=seed_first_run_history,
             resume_failed_invocations=resume_failed_invocations,
+            abort_on_client_disconnect=abort_on_client_disconnect,
         )
         # Store App for per-request App creation with modified agents
         instance._app = app
@@ -3611,6 +3647,7 @@ class ADKAgent:
         app_name = self._get_app_name(input)
         exec_key = (input.thread_id, user_id, app_name)
         session_cache_token = self._session_manager.start_session_read_cache()
+        execution: Optional[ExecutionState] = None
 
         try:
             # Emit RUN_STARTED
@@ -3741,6 +3778,17 @@ class ADKAgent:
                 code="EXECUTION_ERROR"
             )
         finally:
+            if (
+                execution is not None
+                and execution.abort_signal is not None
+                and not execution.task.done()
+            ):
+                # The client stopped reading before the run ended: it aborted
+                # the run, or the stream ended on EXECUTION_TIMEOUT. A run that
+                # ended normally has left Runner.run_async already, where the
+                # signal does nothing.
+                logger.info(f"Aborting the ADK invocation of thread {input.thread_id}: its client stopped reading")
+                execution.abort_signal.set()
             try:
                 # The ADK runner can mutate session state without going
                 # through SessionManager, so the parent context's pre-run read
@@ -4117,6 +4165,9 @@ class ADKAgent:
 
         if failed_invocation_id:
             run_kwargs["failed_invocation_id"] = failed_invocation_id
+        abort_signal = asyncio.Event() if self._abort_on_client_disconnect else None
+        if abort_signal is not None:
+            run_kwargs["abort_signal"] = abort_signal
 
         task = asyncio.create_task(self._run_adk_in_background(**run_kwargs))
         logger.debug(f"Background task created for thread {input.thread_id}: {task}")
@@ -4127,6 +4178,7 @@ class ADKAgent:
             event_queue=event_queue,
             long_running_tool_ids=long_running_tool_ids,
             interrupts=event_queue.interrupts,
+            abort_signal=abort_signal,
         )
     
     async def _run_adk_in_background(
@@ -4143,6 +4195,7 @@ class ADKAgent:
         on_accepted: Optional[Callable[[], Awaitable[None]]] = None,
         history_seed: Optional[List[Any]] = None,
         failed_invocation_id: Optional[str] = None,
+        abort_signal: Optional[asyncio.Event] = None,
     ):
         """Run ADK agent in background, emitting events to queue.
 
@@ -4160,6 +4213,8 @@ class ADKAgent:
             on_accepted: Consumes the answer this run continues (see
                 ``_start_new_execution``). Awaited only after the session read
                 succeeds, so a failed lookup leaves the answer retryable.
+            abort_signal: Passed to ``Runner.run_async`` (see
+                ``abort_on_client_disconnect``); set, ADK aborts the invocation.
         """
         # Default for older call paths / tests that don't supply the set.
         if long_running_tool_ids is None:
@@ -4695,6 +4750,8 @@ class ADKAgent:
                 # Continue a failed invocation (resume_failed_invocations).
                 run_kwargs["invocation_id"] = failed_invocation_id
                 run_kwargs["new_message"] = None
+            if abort_signal is not None:
+                run_kwargs["abort_signal"] = abort_signal
 
             # mark_messages_processed keeps the ledger in process memory, so a
             # replica that did not serve this turn would treat the client's

@@ -26,6 +26,7 @@ class ExecutionState:
         event_queue: asyncio.Queue,
         long_running_tool_ids: Optional[Set[str]] = None,
         interrupts: Optional[List[Any]] = None,
+        abort_signal: Optional[asyncio.Event] = None,
     ):
         """Initialize execution state.
 
@@ -42,6 +43,9 @@ class ExecutionState:
             interrupts: Shared list the producer fills with the AG-UI
                 ``Interrupt`` objects the run paused on; the consumer reports
                 them in ``RUN_FINISHED.outcome``.
+            abort_signal: The event passed to ``Runner.run_async`` when the
+                agent aborts an invocation whose client stopped reading
+                (``abort_on_client_disconnect``); None otherwise.
         """
         self.task = task
         self.thread_id = thread_id
@@ -53,6 +57,7 @@ class ExecutionState:
             long_running_tool_ids if long_running_tool_ids is not None else set()
         )
         self.interrupts: List[Any] = interrupts if interrupts is not None else []
+        self.abort_signal = abort_signal
 
         logger.debug(f"Created execution state for thread {thread_id}")
 
