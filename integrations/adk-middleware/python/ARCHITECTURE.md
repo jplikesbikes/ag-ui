@@ -156,10 +156,16 @@ policy.
 ## Error Handling
 
 - RunErrorEvent for various failure scenarios
-- A run whose last ADK event is a model error response (an `error_code`
-  without content, e.g. `SAFETY` or `MALFORMED_FUNCTION_CALL`) ends in
-  `RUN_ERROR` with that `code` and a fixed `message`; ADK's `error_message` is
-  not forwarded
+- A run whose last ADK event is a model error response ends in `RUN_ERROR`
+  with its `error_code` as `code` and a fixed `message`; ADK's
+  `error_message` is not forwarded. An error response is an `error_code`
+  without content, or a failure code whatever reasoning, blank or partial
+  text the response also holds: google.genai's finish and block reasons
+  other than `STOP`, `MAX_TOKENS` and `CONTINUATION` (`SAFETY`,
+  `MALFORMED_FUNCTION_CALL`, ...), and ADK 2.x's `MODEL_RETURNED_NO_CONTENT`.
+  `MAX_TOKENS` on a response with content is a truncated answer, and the
+  content stands. `INVOCATION_ABORTED` (ADK's seal of an aborted invocation)
+  is a cancellation, not an error
 - Proper async exception handling
 - Resource cleanup on errors
 - Timeout management at multiple levels
