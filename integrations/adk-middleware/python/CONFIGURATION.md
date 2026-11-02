@@ -349,6 +349,45 @@ agent = ADKAgent(
 2. **Execution Timeout**: Applied to entire agent execution
 3. **Session Timeout**: Applied to user session inactivity
 
+### Client Disconnects
+
+A run's ADK invocation runs in a background task, and the client reads its
+events from a queue. By default, when the client stops reading before the run
+ends (it aborts the run, for example a Stop button that aborts the request, or
+the connection drops, or the stream ends on `EXECUTION_TIMEOUT`), ADK keeps
+running the invocation to its end: the tool finishes, the model replies, and
+the reply is saved to the session for the next read.
+
+Set `abort_on_client_disconnect=True` (on `ADKAgent` or `ADKAgent.from_app()`)
+to end the turn instead:
+
+```python
+agent = ADKAgent(
+    adk_agent=my_agent,
+    app_name="my_app",
+    user_id="user123",
+    abort_on_client_disconnect=True,
+)
+```
+
+The agent then sets the `abort_signal` it passes to `Runner.run_async`. ADK
+stops the running tool or model call, calls nothing further, and seals the
+invocation in the session as ADK does for any aborted invocation: each call
+left without a response gets a `{"error": "Invocation was aborted by
+client."}` response, and the sealing events carry `error_code`
+`INVOCATION_ABORTED`. A later run on the thread starts from that sealed
+history; ADK does not re-run a sealed call.
+
+The trade-off: the server cannot tell a deliberate stop from a dropped
+connection, so a network drop or a closed tab also cancels the turn, and a
+tool with side effects can be stopped part way. Keep the default when a turn
+should finish whatever happens to the client (for example when clients reload
+the thread to read the result).
+
+`abort_signal` is google-adk 2.x. On google-adk 1.x the option has no effect:
+a warning is logged when the agent is created, and runs continue after their
+client disconnects.
+
 ## Concurrent Execution Limits
 
 Control resource usage with execution limits:
