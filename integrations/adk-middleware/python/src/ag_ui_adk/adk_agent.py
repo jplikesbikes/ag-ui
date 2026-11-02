@@ -984,13 +984,13 @@ class ADKAgent:
         without a response. A new message would then reach the model after a
         call with no answer, which model APIs reject (ADK 1.x) or which ADK
         drops from the request (ADK 2.x), so the model never learns the call
-        failed. Only a ``failed`` invocation is sealed; a call waiting for the
-        user (``input-required``) is left open.
+        failed. Only a ``failed`` invocation is sealed, with its outcome code;
+        a call waiting for the user (``input-required``) is left open.
         """
         outcome = invocation_outcome(session, resumable=self._is_adk_resumable())
         if outcome is None or outcome.state != "failed" or not outcome.invocation_id:
             return
-        seals = unanswered_call_seals(session.events, outcome.invocation_id)
+        seals = unanswered_call_seals(session.events, outcome.invocation_id, outcome.code)
         if not seals:
             return
         logger.info(
