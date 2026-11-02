@@ -24,6 +24,8 @@ from google.adk.agents import LlmAgent
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_response import LlmResponse
 from google.adk.sessions import InMemorySessionService
+from google.adk.tools.base_toolset import BaseToolset
+from google.adk.tools.function_tool import FunctionTool
 from google.genai import types
 
 needs_abort_signal = pytest.mark.skipif(
@@ -64,6 +66,23 @@ def fresh_session_manager():
     SessionManager.reset_instance()
 
 
+def broken(q: str) -> dict:
+    """Always fails."""
+    raise RuntimeError("tool failed")
+
+
+class SlowToClose(BaseToolset):
+    """A toolset that takes a moment to close, as one holding a connection does: the
+    runner closes it after the invocation ends, so the run's task outlives its
+    terminal event."""
+
+    async def get_tools(self, readonly_context=None):
+        return [FunctionTool(broken)]
+
+    async def close(self) -> None:
+        await asyncio.sleep(0.2)
+
+
 class Harness:
     def __init__(self, steps, **options):
         self.gate = asyncio.Event()
@@ -78,7 +97,10 @@ class Harness:
 
         self.model = Scripted(steps=list(steps))
         self.agent = ADKAgent(
-            adk_agent=LlmAgent(name="root", model=self.model, instruction="r", tools=[slow]),
+            adk_agent=LlmAgent(
+                name="root", model=self.model, instruction="r",
+                tools=[slow, SlowToClose()],
+            ),
             app_name="abort",
             user_id="u",
             session_service=InMemorySessionService(),
@@ -182,6 +204,21 @@ async def test_a_run_that_ends_normally_is_not_aborted():
     assert abort_seals(session_events) == []
     assert not any(event.error_code for event in session_events)
     assert harness.model.steps == []
+
+
+@needs_abort_signal
+@pytest.mark.asyncio
+async def test_a_run_that_ends_in_run_error_is_not_aborted(caplog):
+    """The run's own RUN_ERROR reaches the client while ADK is still unwinding;
+    the client read the run to its end, so nothing is aborted."""
+    harness = Harness([calls("broken", q="x")], abort_on_client_disconnect=True)
+
+    with caplog.at_level(logging.INFO, logger="ag_ui_adk"):
+        events = await harness.run()
+
+    assert events[-1].type == EventType.RUN_ERROR
+    assert not [r for r in caplog.records if "Aborting the ADK invocation" in r.getMessage()]
+    assert abort_seals(await harness.session_events()) == []
 
 
 @pytest.mark.asyncio

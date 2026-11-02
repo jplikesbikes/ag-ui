@@ -3303,6 +3303,9 @@ class ADKAgent:
         exec_key = (input.thread_id, user_id, app_name)
         session_cache_token = self._session_manager.start_session_read_cache()
         execution: Optional[ExecutionState] = None
+        # Whether the run reached its own terminal event (see the abort in
+        # ``finally``).
+        run_ended = False
 
         try:
             # Emit RUN_STARTED
@@ -3385,6 +3388,8 @@ class ADKAgent:
                 if isinstance(event, RunErrorEvent):
                     run_errored = True
 
+                if isinstance(event, RunErrorEvent):
+                    run_ended = True
                 logger.debug(f"Yielding event: {type(event).__name__}")
                 yield event
 
@@ -3409,6 +3414,7 @@ class ADKAgent:
                     f"Emitting RUN_FINISHED for thread {input.thread_id}, run {input.run_id}"
                     + (f" with {len(run_interrupts)} interrupt(s)" if report_interrupts else "")
                 )
+                run_ended = True
                 yield RunFinishedEvent(
                     type=EventType.RUN_FINISHED,
                     thread_id=input.thread_id,
@@ -3432,11 +3438,14 @@ class ADKAgent:
                 execution is not None
                 and execution.abort_signal is not None
                 and not execution.task.done()
+                and (not run_ended or execution.is_stale(self._execution_timeout))
             ):
                 # The client stopped reading before the run ended: it aborted
-                # the run, or the stream ended on EXECUTION_TIMEOUT. A run that
-                # ended normally has left Runner.run_async already, where the
-                # signal does nothing.
+                # the run (left before its terminal event), or the stream gave
+                # up on it (EXECUTION_TIMEOUT, past the stale limit). A run that
+                # ended by itself, in RUN_FINISHED or its own RUN_ERROR, can
+                # still be unwinding here (the runner closing its toolsets);
+                # it is not aborted.
                 logger.info(f"Aborting the ADK invocation of thread {input.thread_id}: its client stopped reading")
                 execution.abort_signal.set()
             try:
