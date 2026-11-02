@@ -16,7 +16,14 @@ from typing import Any, List
 import google.adk
 import pytest
 
-from ag_ui.core import EventType, RunAgentInput, UserMessage
+from ag_ui.core import (
+    AssistantMessage,
+    EventType,
+    FunctionCall,
+    RunAgentInput,
+    ToolCall,
+    UserMessage,
+)
 from ag_ui_adk import ADKAgent, invocation_outcome
 from ag_ui_adk.session_manager import SessionManager
 from google.adk.agents import LlmAgent
@@ -235,6 +242,38 @@ async def test_a_model_error_response_asks_the_model_again():
     else:
         assert model.calls == 1
         assert invocation_outcome(await session_of(agent)).state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_resends_the_streamed_messages_resumes():
+    """A live client retries with the messages the failed run streamed, under the
+    ids it streamed them with, which the session history does not use. They are
+    skipped as history; the run is still a retry and resumes."""
+    agent, _ = build([calls("flaky_once", q="x"), say("recovered")])
+    failed = await run(agent, "r-1")
+    (start,) = [e for e in failed if e.type == EventType.TOOL_CALL_START]
+    streamed = AssistantMessage(
+        id=start.parent_message_id or "streamed-1",
+        role="assistant",
+        tool_calls=[
+            ToolCall(
+                id=start.tool_call_id,
+                type="function",
+                function=FunctionCall(name=start.tool_call_name, arguments='{"q": "x"}'),
+            )
+        ],
+    )
+    retry = RunAgentInput(
+        thread_id="t-1", run_id="r-2", state={}, tools=[], context=[],
+        forwarded_props={}, messages=[ASK, streamed],
+    )
+
+    retried = [event async for event in agent.run(retry)]
+
+    assert retried[-1].type == EventType.RUN_FINISHED
+    if ADK_MAJOR >= 2:
+        assert text(retried) == "recovered"
+        await assert_completed_once(agent)
 
 
 @pytest.mark.asyncio
