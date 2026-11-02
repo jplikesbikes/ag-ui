@@ -705,7 +705,18 @@ otherwise `{"state": ..., "code": ...}` (`code` only when there is one).
 | `failed` | the invocation ended on an ADK error, even one followed by `end_of_agent`: an `error_code` without content, or a model response with a failure `error_code` whatever reasoning or partial text it holds (`MAX_TOKENS` with content is a truncated answer, so `completed`) | the ADK `error_code`, e.g. `SAFETY`, `MALFORMED_FUNCTION_CALL`, `MODEL_RETURNED_NO_CONTENT` (ADK 2.x), or on ADK 2.x the class of the exception a tool or model raised |
 | `failed` | a tool call has no response (the process died mid-tool; on ADK 1.x also a tool that raised) | `INTERRUPTED_IN_TOOL` |
 | `failed` | the invocation stopped without completing (the process died) | `INTERRUPTED` |
-| `canceled` | ADK sealed the invocation as aborted | `INVOCATION_ABORTED` |
+| `canceled` | ADK sealed the invocation as aborted (a caller's `abort_signal`) | `INVOCATION_ABORTED` |
+
+Before a new message runs after a `failed` invocation, the agent answers the
+invocation's unanswered calls (other than long-running ones, which wait for
+the user), so the history the model sees pairs every call with a response.
+Each such call gets the function response `{"error": "<code>"}`, in an event
+authored by the agent that made the call, with the invocation's
+`invocation_id` and `error_code` `<code>`, where `<code>` is the invocation's
+`failed` code (an exception class name such as `RuntimeError` on ADK 2.x, or
+`INTERRUPTED_IN_TOOL`). No exception text is written. The invocation then
+still reads `failed` with that code; ADK's own abort seal (`error_code`
+`INVOCATION_ABORTED`) is what reads `canceled`.
 
 The status is derived from the session's events alone; nothing extra is
 stored. ADK writes the `end_of_agent` markers that record completion only for

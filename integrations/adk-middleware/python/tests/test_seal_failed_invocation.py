@@ -4,8 +4,10 @@ A tool that raised, or a process that died mid-tool, leaves the function call
 without a response. The next message then reached the model right after a call
 with no answer: model APIs reject that history (ADK 1.x sends it as is), and
 ADK 2.x drops the orphaned call, so the model never learns it failed. Before a
-new message runs, the failed invocation's unanswered calls are answered in
-ADK's own abort-seal shape. A call that waits for the user is never touched.
+new message runs, the failed invocation's unanswered calls are answered with
+the failure that left them open: ``{"error": <code>}`` responses in events
+carrying that ``error_code``, so the invocation still reads as failed. A call
+that waits for the user is never touched.
 """
 
 from typing import Any, List
@@ -13,10 +15,10 @@ from typing import Any, List
 import pytest
 
 from ag_ui.core import EventType, RunAgentInput, UserMessage
-from ag_ui_adk import ADKAgent
+from ag_ui_adk import ADKAgent, invocation_outcome
 from ag_ui_adk.event_translator import (
+    INTERRUPTED_IN_TOOL,
     INVOCATION_ABORTED,
-    INVOCATION_ABORTED_MESSAGE,
     unanswered_call_seals,
 )
 from ag_ui_adk.session_manager import SessionManager
@@ -128,7 +130,11 @@ async def session_of(agent: ADKAgent):
 
 
 def seals_in(session) -> List[Event]:
-    return [event for event in session.events if event.error_code == INVOCATION_ABORTED]
+    """Events that answer calls and carry an error_code."""
+    return [
+        event for event in session.events
+        if event.error_code and event.get_function_responses()
+    ]
 
 
 FIRST = UserMessage(id="u-1", role="user", content="first")
@@ -154,22 +160,28 @@ async def test_a_raised_tool_call_is_answered_before_the_next_message():
 
 
 @pytest.mark.asyncio
-async def test_the_seal_has_adks_abort_shape_and_the_original_invocation():
+async def test_the_seal_carries_the_failure_and_the_original_invocation():
     agent, _, _ = build([calls("flaky", q="x"), say("second answer")])
     await run(agent, "r-1", [FIRST])
     before = await session_of(agent)
+    failed = invocation_outcome(before)
     (call_event,) = [e for e in before.events if e.get_function_calls()]
+    # ADK 2.x records the raise; ADK 1.x leaves only the open call.
+    assert failed.state == "failed"
+    assert failed.code in {"RuntimeError", INTERRUPTED_IN_TOOL}
 
     await run(agent, "r-2", [FIRST, SECOND])
 
     (seal,) = seals_in(await session_of(agent))
     assert seal.invocation_id == call_event.invocation_id
     assert seal.author == "root"
-    assert seal.error_message == INVOCATION_ABORTED_MESSAGE
+    assert seal.error_code == failed.code
+    assert seal.error_message is None
     (response,) = seal.get_function_responses()
     (call,) = call_event.get_function_calls()
     assert (response.id, response.name) == (call.id, call.name)
-    assert response.response == {"error": INVOCATION_ABORTED_MESSAGE}
+    assert response.response == {"error": failed.code}
+    assert "tool failed" not in str(seal.model_dump())
 
 
 @pytest.mark.asyncio
@@ -213,6 +225,7 @@ async def test_a_call_whose_process_died_is_sealed():
 
     (seal,) = seals_in(await session_of(agent))
     assert seal.invocation_id == "e-killed"
+    assert seal.error_code == INTERRUPTED_IN_TOOL
     history = model.requests[-1]
     assert history.index(("model", "call", "lookup")) + 1 == history.index(
         ("user", "response", "lookup")
@@ -271,7 +284,76 @@ def test_the_builder_skips_long_running_and_answered_calls():
     )
     events = [call_event("done", "open"), answered, call_event("waiting", lro=["waiting"])]
 
-    (seal,) = unanswered_call_seals(events, "e-1")
+    (seal,) = unanswered_call_seals(events, "e-1", INTERRUPTED_IN_TOOL)
 
     assert [r.id for r in seal.get_function_responses()] == ["open"]
-    assert unanswered_call_seals(events, "e-other") == []
+    assert unanswered_call_seals(events, "e-other", INTERRUPTED_IN_TOOL) == []
+
+
+def killed_mid_tool_session(*extra: Event):
+    from google.adk.sessions import Session
+
+    return Session(id="s", app_name="seal", user_id="u", state={}, events=[
+        Event(invocation_id="e-1", author="user",
+              content=types.Content(role="user", parts=[types.Part(text="go")])),
+        Event(invocation_id="e-1", author="root",
+              content=types.Content(role="model", parts=[types.Part(
+                  function_call=types.FunctionCall(id="c-1", name="lookup", args={})
+              )])),
+        *extra,
+    ])
+
+
+def test_a_sealed_invocation_still_reads_failed_with_its_code():
+    """The seal records the failure, so the outcome is unchanged by it, and a
+    second pass finds nothing left to seal."""
+    session = killed_mid_tool_session()
+    before = invocation_outcome(session)
+    assert (before.state, before.code) == ("failed", INTERRUPTED_IN_TOOL)
+
+    session.events.extend(unanswered_call_seals(session.events, "e-1", before.code))
+
+    after = invocation_outcome(session)
+    assert (after.state, after.code) == ("failed", INTERRUPTED_IN_TOOL)
+    assert unanswered_call_seals(session.events, "e-1", after.code) == []
+
+
+def test_adks_own_abort_seal_is_still_a_cancel():
+    session = killed_mid_tool_session(Event(
+        invocation_id="e-1", author="root", error_code=INVOCATION_ABORTED,
+        content=types.Content(role="user", parts=[types.Part(
+            function_response=types.FunctionResponse(
+                id="c-1", name="lookup", response={"error": "Invocation was aborted by client."}
+            )
+        )]),
+    ))
+
+    result = invocation_outcome(session)
+
+    assert (result.state, result.code) == ("canceled", INVOCATION_ABORTED)
+
+
+@pytest.mark.asyncio
+async def test_a_start_that_fails_after_the_seal_leaves_the_thread_failed():
+    """If the new message's run fails between the seal and ADK's first event,
+    the thread still reads failed with its code, and the next message runs
+    without sealing again."""
+    agent, model, _ = build([calls("flaky", q="x"), say("second answer")])
+    await run(agent, "r-1", [FIRST])
+    failed = invocation_outcome(await session_of(agent))
+    # What a new message's start leaves when it fails after sealing.
+    session = await session_of(agent)
+    for seal in unanswered_call_seals(session.events, failed.invocation_id, failed.code):
+        await agent._session_manager._session_service.append_event(session, seal)
+    agent._session_manager.invalidate_session(session.id, "seal", "u")
+
+    after = invocation_outcome(await session_of(agent))
+    assert (after.state, after.code, after.invocation_id) == (
+        "failed", failed.code, failed.invocation_id
+    )
+
+    second = await run(agent, "r-2", [FIRST, SECOND])
+
+    assert second[-1].type == EventType.RUN_FINISHED
+    assert len(seals_in(await session_of(agent))) == 1
+    assert model.requests[-1][-2:] == [("user", "response", "flaky"), ("user", "text", "second")]

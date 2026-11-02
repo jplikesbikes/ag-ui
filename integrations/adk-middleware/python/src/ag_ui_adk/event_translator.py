@@ -1845,12 +1845,10 @@ def invocation_outcome(
     return outcome("failed", INTERRUPTED)
 
 
-#: The message ADK's abort seal answers a dangling call with.
-INVOCATION_ABORTED_MESSAGE = "Invocation was aborted by client."
-
-
-def unanswered_call_seals(events: List[Any], invocation_id: str) -> List[ADKEvent]:
-    """Events that close an invocation's unanswered function calls.
+def unanswered_call_seals(
+    events: List[Any], invocation_id: str, error_code: str
+) -> List[ADKEvent]:
+    """Events that close a failed invocation's unanswered function calls.
 
     Each call the invocation made without a response, other than a
     long-running one (a client tool or confirmation still waiting for its
@@ -1860,13 +1858,16 @@ def unanswered_call_seals(events: List[Any], invocation_id: str) -> List[ADKEven
     turn"); ADK 2.x instead drops the orphaned call, and the model never
     learns the tool was called.
 
-    The shape is ADK's own abort seal (``google.adk.events._abort_events.
-    _build_abort_events``, ADK >= 2.x; private, so mirrored here with public
-    types): one event per (author, branch, isolation scope) of the calls'
-    events, authored by the agent that issued them, with the original
-    ``invocation_id``, ``error_code`` ``INVOCATION_ABORTED`` and
-    ``{"error": "Invocation was aborted by client."}`` responses. ADK reads
-    such a call as aborted rather than replaying it.
+    The seal records the failure that left the calls open, ``error_code``
+    (the invocation's failed outcome code: an exception class name such as
+    ``RuntimeError`` on ADK 2.x, or ``INTERRUPTED_IN_TOOL``): each response is
+    ``{"error": error_code}`` and each event carries that ``error_code``, so
+    ``invocation_outcome`` still reads the invocation as failed with it. No
+    exception text is written; the model sees only that the call failed. The
+    events follow the layout of ADK's own seal of an aborted invocation: one
+    per (author, branch, isolation scope) of the calls' events, authored by the
+    agent that issued them, with the original ``invocation_id``. A sealed call
+    is answered, so ADK does not run it again.
     """
     invocation_events = [e for e in events if e.invocation_id == invocation_id]
     answered = {
@@ -1904,14 +1905,13 @@ def unanswered_call_seals(events: List[Any], invocation_id: str) -> List[ADKEven
                             function_response=types.FunctionResponse(
                                 id=call.id,
                                 name=call.name,
-                                response={"error": INVOCATION_ABORTED_MESSAGE},
+                                response={"error": error_code},
                             )
                         )
                         for call in calls
                     ],
                 ),
-                error_code=INVOCATION_ABORTED,
-                error_message=INVOCATION_ABORTED_MESSAGE,
+                error_code=error_code,
                 **extra,
             )
         )
