@@ -101,7 +101,7 @@ def fresh_state():
     SessionManager.reset_instance()
 
 
-def build(steps, helper_steps=(), *, resume=True, resumable=True):
+def build(steps, helper_steps=(), *, resume=True, resumable=True, service=None):
     model = Scripted(steps=list(steps))
     helper = LlmAgent(
         name="helper", model=Scripted(steps=list(helper_steps)), description="A helper."
@@ -122,7 +122,7 @@ def build(steps, helper_steps=(), *, resume=True, resumable=True):
             resumability_config=ResumabilityConfig(is_resumable=True),
         ),
         user_id="u",
-        session_service=InMemorySessionService(),
+        session_service=service or InMemorySessionService(),
         resume_failed_invocations=resume,
     ), model
 
@@ -196,9 +196,13 @@ async def test_a_raised_tool_resumes_to_the_model():
     assert retried[-1].type == EventType.RUN_FINISHED
     assert text(retried) == "recovered"
     await assert_completed_once(agent)
-    # ADK 2.x records the raise, so the call is closed as aborted and the tool
-    # is not re-run; ADK 1.x records nothing, so the open call is executed again.
-    assert TOOL_RUNS.count("flaky_once") in (1, 2)
+    # ADK 2.x records the raise, so the call is sealed with it and the tool is
+    # not re-run; ADK 1.x records nothing, so the open call is executed again.
+    assert TOOL_RUNS.count("flaky_once") == (1 if ADK_MAJOR >= 2 else 2)
+    if ADK_MAJOR >= 2:
+        (seal,) = seals_in(await session_of(agent))
+        assert seal.error_code == "RuntimeError"
+        assert [r.response for r in seal.get_function_responses()] == [{"error": "RuntimeError"}]
 
 
 @pytest.mark.asyncio
@@ -311,3 +315,116 @@ async def test_without_the_option_or_resumability_a_retry_stays_empty(options):
 
     assert kinds(again) == EMPTY
     assert model.calls == 2
+
+
+class YieldingSessionService(InMemorySessionService):
+    """Each read and write really yields, as a database session service does,
+    so concurrent runs interleave between them."""
+
+    async def get_session(self, **kwargs):
+        await asyncio.sleep(0.005)
+        return await super().get_session(**kwargs)
+
+    async def list_sessions(self, **kwargs):
+        await asyncio.sleep(0.005)
+        return await super().list_sessions(**kwargs)
+
+    async def append_event(self, session, event):
+        await asyncio.sleep(0.005)
+        return await super().append_event(session, event)
+
+
+def seals_in(session) -> list:
+    """Events that answer calls and carry an error_code."""
+    return [e for e in session.events if e.error_code and e.get_function_responses()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "steps",
+    [
+        [calls("flaky_once", q="x"), say("recovered"), say("DUPLICATE")],
+        [calls("lookup", q="x"), RuntimeError("model 503"), say("recovered"), say("DUPLICATE")],
+    ],
+    ids=["raised tool", "raised model"],
+)
+async def test_two_retries_at_once_resume_once(steps):
+    """The second retry is admitted after the first one's execution ends, so
+    it reads the invocation the first one completed and runs nothing."""
+    agent, model = build(steps, service=YieldingSessionService())
+    await run(agent, "r-1")
+    calls_before = model.calls
+
+    first, second = await asyncio.gather(run(agent, "r-2"), run(agent, "r-3"))
+
+    assert sorted([text(first), text(second)]) == ["", "recovered"]
+    assert EMPTY in (kinds(first), kinds(second))
+    assert model.calls == calls_before + 1
+    assert len(seals_in(await session_of(agent))) <= 1
+    await assert_completed_once(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_retry_whose_start_fails_after_the_seal_stays_retryable():
+    """The seal records the failure, so a retry that fails after writing it
+    (here: creating the runner) leaves the thread failed with the same code,
+    and the next retry resumes it without sealing again."""
+    agent, model = build([calls("flaky_once", q="x"), say("recovered")])
+    await run(agent, "r-1")
+    failed = invocation_outcome(await session_of(agent))
+    create_runner = agent._create_runner
+    attempts = []
+
+    def failing_once(**kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("runner unavailable")
+        return create_runner(**kwargs)
+
+    agent._create_runner = failing_once
+
+    refused = await run(agent, "r-2")
+
+    assert refused[-1].type == EventType.RUN_ERROR
+    after = invocation_outcome(await session_of(agent))
+    assert (after.state, after.code, after.invocation_id) == (
+        "failed", failed.code, failed.invocation_id
+    )
+
+    retried = await run(agent, "r-3")
+
+    assert text(retried) == "recovered"
+    assert len(seals_in(await session_of(agent))) == (1 if ADK_MAJOR >= 2 else 0)
+    await assert_completed_once(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_retry_while_the_invocation_still_runs_does_not_run_it_again():
+    """A client abort ends the stream, not the ADK run, and the execution stays
+    registered until its task ends. The thread reads working, and a retry waits for the invocation
+    instead of resuming it next to itself, then finds it completed."""
+    agent, model = build([calls("slow", q="x"), say("first answer"), say("DUPLICATE")])
+    consumer = asyncio.create_task(run(agent, "r-1"))
+    for _ in range(300):
+        await asyncio.sleep(0.01)
+        if TOOL_RUNS == ["slow"]:
+            break
+    consumer.cancel()  # the client stops reading
+    await asyncio.gather(consumer, return_exceptions=True)
+    assert agent._has_live_execution("t-1", "u", app_name="retry")
+    assert invocation_outcome(
+        await session_of(agent),
+        live=agent._has_live_execution("t-1", "u", app_name="retry"),
+    ).state == "working"
+
+    retry = asyncio.create_task(run(agent, "r-2"))
+    await asyncio.sleep(0.1)
+    assert not retry.done()
+    GATE["open"].set()
+    retried = await retry
+
+    assert kinds(retried) == EMPTY
+    assert TOOL_RUNS == ["slow"]
+    assert model.calls == 2
+    assert seals_in(await session_of(agent)) == []
+    await assert_completed_once(agent)
