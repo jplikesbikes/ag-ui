@@ -1706,20 +1706,34 @@ def _closed_by_adk(events: List[Any], last: Any) -> bool:
     no agent is left part way, the agent that spoke last closed after it spoke,
     and that last word was not a hand-off: on ``transfer_to_agent`` the
     transferring agent closes before the target runs.
+
+    A checkpoint opened while a tool call was open belongs to a run nested in
+    that call (a workflow a tool runs with ``run_node``, an agent tool): the
+    call's response ends that run, however it ended. A node that raised leaves
+    its workflow's checkpoint without an ``end_of_agent``, and the caller can
+    still recover from the error and finish.
     """
     if not getattr(_event_actions(events[-1]), "end_of_agent", None):
         return False
     if last is not None and getattr(_event_actions(last), "transfer_to_agent", None):
         return False
-    part_way: Set[str] = set()
+    # Agent -> the calls that were open when its first open checkpoint was written.
+    part_way: Dict[str, Set[str]] = {}
+    open_calls: Set[str] = set()
     for event in events:
+        open_calls.update(call.id for call in event.get_function_calls() or [] if call.id)
+        answered = {r.id for r in event.get_function_responses() or [] if r.id}
+        if answered:
+            open_calls -= answered
+            for author in [a for a, during in part_way.items() if during & answered]:
+                del part_way[author]
         actions = _event_actions(event)
         if actions is None:
             continue
         if getattr(actions, "end_of_agent", None):
-            part_way.discard(event.author)
+            part_way.pop(event.author, None)
         elif getattr(actions, "agent_state", None) is not None:
-            part_way.add(event.author)
+            part_way.setdefault(event.author, set(open_calls))
     if part_way:
         return False
     if last is None or last.author == "user":

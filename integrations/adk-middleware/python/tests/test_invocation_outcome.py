@@ -287,6 +287,17 @@ SHAPES = {
          ev("root", response="transfer_to_agent", transfer="helper"), ev("root", end=True)],
         ("failed", INTERRUPTED),
     ),
+    "a workflow run by a tool failed, the caller recovered": (
+        [USER, ev("root", call="recommend"), ev("wf", agent_state={}),
+         ev("wf", error="RuntimeError"), ev("root", response="recommend"),
+         ev("root", text="sorry"), ev("root", end=True)],
+        ("completed", None),
+    ),
+    "a workflow run by a tool still running when the process died": (
+        [USER, ev("root", call="recommend"), ev("wf", agent_state={}),
+         ev("wf", text="step")],
+        ("failed", INTERRUPTED_IN_TOOL),
+    ),
     "killed between two steps of a sequential agent": (
         [USER, ev("seq", agent_state={"current_sub_agent": "a"}), ev("a", text="A"),
          ev("a", end=True), ev("seq", agent_state={"current_sub_agent": "b"})],
@@ -590,6 +601,53 @@ async def test_runner_session_with_only_reasoning():
     }
     if int(google.adk.__version__.split(".")[0]) >= 2:
         assert result.code == "MODEL_RETURNED_NO_CONTENT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    int(google.adk.__version__.split(".")[0]) < 2, reason="Workflow is ADK 2.x"
+)
+async def test_runner_session_whose_tool_ran_a_failing_workflow_and_recovered():
+    """A tool runs a workflow with ``run_node`` and a node raises, so the
+    workflow's checkpoint never closes; ReflectAndRetry hands the error back to
+    the model, which answers. The turn completed."""
+    from google.adk.plugins.reflect_retry_tool_plugin import ReflectAndRetryToolPlugin
+    from google.adk.tools.tool_context import ToolContext
+    from google.adk.workflow import START, FunctionNode, Workflow
+
+    async def fails(ctx, node_input):
+        raise RuntimeError("node failed")
+
+    workflow = Workflow(name="wf", edges=[(START, FunctionNode(func=fails, name="fails"))])
+
+    async def recommend(q: str, tool_context: ToolContext) -> str:
+        """Runs the workflow."""
+        return await tool_context.run_node(workflow, node_input=q, use_as_output=True)
+
+    root = LlmAgent(
+        name="root", model=Scripted(steps=[calls("recommend", q="x"), say("sorry")]),
+        instruction="r", tools=[recommend],
+    )
+    service = InMemorySessionService()
+    app = App(
+        name="outcome", root_agent=root,
+        resumability_config=ResumabilityConfig(is_resumable=True),
+        plugins=[ReflectAndRetryToolPlugin(max_retries=1)],
+    )
+    runner = Runner(app=app, session_service=service)
+    created = await service.create_session(app_name="outcome", user_id="u")
+    async for _ in runner.run_async(
+        user_id="u", session_id=created.id,
+        new_message=types.Content(role="user", parts=[types.Part(text="go")]),
+    ):
+        pass
+    done = await service.get_session(app_name="outcome", user_id="u", session_id=created.id)
+
+    assert any(
+        e.author == "wf" and e.actions and e.actions.agent_state is not None
+        for e in done.events
+    ), "the workflow must leave a checkpoint for this test to mean anything"
+    assert state_and_code(invocation_outcome(done)) == ("completed", None)
 
 
 @pytest.mark.asyncio
