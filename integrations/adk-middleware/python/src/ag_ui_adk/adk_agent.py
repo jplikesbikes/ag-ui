@@ -3190,8 +3190,10 @@ class ADKAgent:
                 logger.debug(f"Got event #{event_count} from queue: {type(event).__name__ if event else 'None'} (thread {execution.thread_id})")
 
                 if event is None:
-                    # Execution complete
-                    execution.is_complete = True
+                    # The producer signalled completion. Let its task finish
+                    # (runner close, bookkeeping) so the run's stream ends
+                    # with the execution, not before it.
+                    await asyncio.wait({execution.task})
                     logger.debug(f"Execution complete for thread {execution.thread_id} after {event_count} events")
                     break
                 
@@ -3215,7 +3217,6 @@ class ADKAgent:
                 # Check if task is done
                 if execution.task.done():
                     # Task completed but didn't send None
-                    execution.is_complete = True
                     try:
                         task_result = execution.task.result()
                         logger.debug(f"Task completed with result: {task_result} (thread {execution.thread_id})")
@@ -3276,41 +3277,57 @@ class ADKAgent:
                 protocol_version=PROTOCOL_VERSION,
             )
             
-            # Check concurrent execution limit
-            async with self._execution_lock:
-                if len(self._active_executions) >= self._max_concurrent:
-                    # Clean up stale executions
-                    await self._cleanup_stale_executions()
-                    
-                    if len(self._active_executions) >= self._max_concurrent:
-                        raise RuntimeError(
-                            f"Maximum concurrent executions ({self._max_concurrent}) reached"
-                        )
-                
-                # Check if there's an existing execution for this thread+user and wait for it
-                existing_execution = self._active_executions.get(exec_key)
+            # Admission: the check for a running execution of this thread
+            # and the registration of this one happen in one hold of the
+            # lock, so of two runs arriving together the second always waits
+            # for the first. An execution stays registered until its task
+            # finishes, even when its client stopped reading.
+            while True:
+                async with self._execution_lock:
+                    existing_execution = self._active_executions.get(exec_key)
+                    if (
+                        existing_execution is not None
+                        and not existing_execution.is_complete
+                        and existing_execution.is_stale(self._execution_timeout)
+                    ):
+                        # Past execution_timeout_seconds: cancelled, not waited on.
+                        await self._cleanup_stale_executions()
+                        existing_execution = self._active_executions.get(exec_key)
+                    if existing_execution is None or existing_execution.is_complete:
+                        # Check concurrent execution limit
+                        if len(self._active_executions) >= self._max_concurrent:
+                            # Clean up stale executions
+                            await self._cleanup_stale_executions()
 
-            # If there was an existing execution, wait for it to complete
-            if existing_execution and not existing_execution.is_complete:
+                            if len(self._active_executions) >= self._max_concurrent:
+                                raise RuntimeError(
+                                    f"Maximum concurrent executions ({self._max_concurrent}) reached"
+                                )
+
+                        # Start background execution and store it (replacing
+                        # any previous, finished one)
+                        execution = await self._start_background_execution(
+                            input,
+                            tool_results=tool_results,
+                            message_batch=message_batch,
+                            **({"on_accepted": on_accepted} if on_accepted is not None else {}),
+                            **({"history_seed": history_seed} if history_seed else {}),
+                        )
+                        self._active_executions[exec_key] = execution
+                        break
+
+                # Wait for the existing execution outside the lock, at most
+                # until it is stale, then check again. asyncio.wait, unlike
+                # awaiting the task, does not cancel it if this run's client
+                # goes away meanwhile.
                 logger.debug(f"Waiting for existing execution to complete for thread {input.thread_id}")
-                try:
-                    await existing_execution.task
-                except Exception as e:
-                    logger.debug(f"Previous execution completed with error: {e}")
-            
-            # Start background execution
-            execution = await self._start_background_execution(
-                input,
-                tool_results=tool_results,
-                message_batch=message_batch,
-                **({"on_accepted": on_accepted} if on_accepted is not None else {}),
-                **({"history_seed": history_seed} if history_seed else {}),
-            )
-            
-            # Store execution (replacing any previous one)
-            async with self._execution_lock:
-                self._active_executions[exec_key] = execution
-            
+                await asyncio.wait(
+                    {existing_execution.task},
+                    timeout=max(
+                        0.0, self._execution_timeout - existing_execution.get_execution_time()
+                    ),
+                )
+
             # Stream events and track tool calls
             logger.debug(f"Starting to stream events for execution {execution.thread_id}")
             app_name = self._get_app_name(input)
@@ -3395,16 +3412,9 @@ class ADKAgent:
                 # through SessionManager, so the parent context's pre-run read
                 # cache is stale by the time this cleanup guard runs.
                 self._session_manager.disable_session_read_cache()
-                # Clean up execution if complete and no pending tool calls (HITL scenarios)
-                async with self._execution_lock:
-                    if exec_key in self._active_executions:
-                        execution = self._active_executions[exec_key]
-                        execution.is_complete = True
-
-                        # Check if session has pending tool calls before cleanup
-                        has_pending = await self._has_pending_tool_calls(input.thread_id, user_id, app_name=app_name)
-                        if not has_pending:
-                            del self._active_executions[exec_key]
+                # The execution is not released here: a client that stopped
+                # reading leaves its task running, and the task releases the
+                # execution when it finishes (_release_execution).
             finally:
                 self._session_manager.stop_session_read_cache(session_cache_token)
     
@@ -3763,7 +3773,9 @@ class ADKAgent:
         if history_seed:
             run_kwargs["history_seed"] = history_seed
 
-        task = asyncio.create_task(self._run_adk_in_background(**run_kwargs))
+        task = asyncio.create_task(
+            self._run_execution((input.thread_id, user_id, app_name), run_kwargs)
+        )
         logger.debug(f"Background task created for thread {input.thread_id}: {task}")
 
         return ExecutionState(
@@ -3774,6 +3786,40 @@ class ADKAgent:
             interrupts=event_queue.interrupts,
         )
     
+    async def _run_execution(
+        self, exec_key: Tuple[str, str, str], run_kwargs: Dict[str, Any]
+    ) -> None:
+        """The background task of an execution: the ADK run, then its release."""
+        try:
+            await self._run_adk_in_background(**run_kwargs)
+        finally:
+            await self._release_execution(exec_key)
+
+    async def _release_execution(self, exec_key: Tuple[str, str, str]) -> None:
+        """Remove the calling task's execution from ``_active_executions``.
+
+        Runs as the task's last step, so the execution is registered for as
+        long as its task runs, whether or not a client still reads its
+        stream. An execution whose run paused on pending tool calls (HITL) is
+        kept, complete, until the next run of the thread replaces it. Runs
+        without ``_execution_lock``: ``close()`` and the stale-execution
+        cleanup hold it while they await a cancelled task, which ends here.
+        """
+        execution = self._active_executions.get(exec_key)
+        if execution is None or execution.task is not asyncio.current_task():
+            return
+        # The ADK runner can mutate session state without going through
+        # SessionManager, so a read cache from before the run is stale.
+        self._session_manager.disable_session_read_cache()
+        thread_id, user_id, app_name = exec_key
+        try:
+            has_pending = await self._has_pending_tool_calls(thread_id, user_id, app_name=app_name)
+        except Exception as e:
+            logger.warning(f"Could not read pending tool calls of thread {thread_id}: {e}")
+            has_pending = False
+        if not has_pending and self._active_executions.get(exec_key) is execution:
+            del self._active_executions[exec_key]
+
     async def _run_adk_in_background(
         self,
         input: RunAgentInput,
@@ -4728,7 +4774,10 @@ class ADKAgent:
                 stale_keys.append(exec_key)
 
         for exec_key in stale_keys:
-            execution = self._active_executions.pop(exec_key)
+            # A task that finished meanwhile released its own entry.
+            execution = self._active_executions.pop(exec_key, None)
+            if execution is None:
+                continue
             await execution.cancel()
             thread_id, _uid, _app = exec_key
             logger.info(f"Cleaned up stale execution for thread {thread_id}")
@@ -4737,7 +4786,9 @@ class ADKAgent:
         """Clean up resources including active executions."""
         # Cancel all active executions
         async with self._execution_lock:
-            for execution in self._active_executions.values():
+            # A cancelled task releases its own entry as it ends, so iterate
+            # over a copy.
+            for execution in list(self._active_executions.values()):
                 await execution.cancel()
             self._active_executions.clear()
 

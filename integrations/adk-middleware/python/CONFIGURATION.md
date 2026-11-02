@@ -368,6 +368,10 @@ agent = ADKAgent(
 ### Resource Management
 
 - Prevents resource exhaustion from runaway executions
+- One execution per thread at a time: a run waits for the thread's running
+  execution, including one whose client stopped reading its stream (ADK keeps
+  running the invocation until it ends), and that execution counts toward
+  `max_concurrent_executions` until it ends
 - Automatic cleanup of stale executions
 - Queue management for tool events
 - Proper task cancellation on timeout

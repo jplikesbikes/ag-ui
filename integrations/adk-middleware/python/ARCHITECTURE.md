@@ -51,6 +51,13 @@ Tracks background ADK executions:
 - Execution timing and completion tracking
 - Tool call state management
 
+An execution is registered per thread for as long as its background task
+runs, not as long as a client reads its stream: a client that stops reading
+(an aborted run, `EXECUTION_TIMEOUT`) leaves ADK running the invocation, and
+the task releases the execution when it finishes. A new run on the thread
+waits for it; the check and the registration happen in one hold of the
+execution lock, so of two runs on one thread only one starts at a time.
+
 ### ClientProxyTool (`client_proxy_tool.py`)
 Individual tool proxy implementation:
 - Wraps AG-UI tools for ADK compatibility
