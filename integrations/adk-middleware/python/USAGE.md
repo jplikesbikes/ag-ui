@@ -700,9 +700,9 @@ otherwise `{"state": ..., "code": ...}` (`code` only when there is one).
 | `state` | When | `code` |
 | --- | --- | --- |
 | `working` | an execution of the thread is running on this instance | |
-| `input-required` | a long-running call (a client tool, an ADK tool confirmation) or a predictive-state review waits for its answer | |
+| `input-required` | a long-running call (a client tool, an ADK tool confirmation) waits for its answer, or a predictive-state review does after an invocation that completed | |
 | `completed` | ADK recorded the invocation as finished | `EMPTY_REPLY` when the agent said nothing |
-| `failed` | the invocation ended on an ADK error response (an `error_code` without content), even one followed by `end_of_agent` | the ADK `error_code`, e.g. `SAFETY`, `MALFORMED_FUNCTION_CALL`, or on ADK 2.x the class of the exception a tool or model raised |
+| `failed` | the invocation ended on an ADK error, even one followed by `end_of_agent`: an `error_code` without content, or a model response with a failure `error_code` whatever reasoning or partial text it holds (`MAX_TOKENS` with content is a truncated answer, so `completed`) | the ADK `error_code`, e.g. `SAFETY`, `MALFORMED_FUNCTION_CALL`, `MODEL_RETURNED_NO_CONTENT` (ADK 2.x), or on ADK 2.x the class of the exception a tool or model raised |
 | `failed` | a tool call has no response (the process died mid-tool; on ADK 1.x also a tool that raised) | `INTERRUPTED_IN_TOOL` |
 | `failed` | the invocation stopped without completing (the process died) | `INTERRUPTED` |
 | `canceled` | ADK sealed the invocation as aborted | `INVOCATION_ABORTED` |
@@ -713,8 +713,15 @@ a resumable app (`ADKAgent.from_app()` with
 `ResumabilityConfig(is_resumable=True)`); without them a run counts as
 completed when its last event is an agent's final response. ADK's
 `error_message` is never returned, as it can carry provider or exception
-detail. `working` reflects this instance only. The same derivation is
-available as `ag_ui_adk.invocation_outcome(session, live=...)`.
+detail. The same derivation is available as
+`ag_ui_adk.invocation_outcome(session, live=...)`.
+
+`working` reflects this process only: it comes from the thread's execution
+on this `ADKAgent` instance. With several instances behind a load balancer, a
+request served by an instance that is not running the invocation reads it as
+`failed` (`INTERRUPTED` or `INTERRUPTED_IN_TOOL`) while it still runs
+elsewhere. Route a thread's requests to one instance (sticky routing) or run
+a single instance where that matters.
 
 **Error response:**
 
