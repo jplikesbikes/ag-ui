@@ -1814,9 +1814,9 @@ def invocation_outcome(
         - ``canceled`` when ADK sealed it as aborted;
         - ``failed`` when its last event is an ADK error response, an
           ``error_code`` without content (``code`` is the ``error_code``),
-          even if an ``end_of_agent`` follows it; when a call
-          it made has no response (``INTERRUPTED_IN_TOOL``); or when it
-          stopped without completing (``INTERRUPTED``);
+          even if an ``end_of_agent`` follows it; when it stopped
+          without completing, with a call it made left without a response
+          (``INTERRUPTED_IN_TOOL``) or not (``INTERRUPTED``);
         - ``completed`` otherwise, with ``code`` ``EMPTY_REPLY`` when no agent
           said anything.
     """
@@ -1864,8 +1864,6 @@ def invocation_outcome(
     # response that has content; that response is the answer, not an error.
     if error_code and not _has_parts(last):
         return outcome("failed", error_code)
-    if open_calls:
-        return outcome("failed", INTERRUPTED_IN_TOOL)
 
     agent_spoke = last is not None and last.author != "user"
     if resumable:
@@ -1876,8 +1874,13 @@ def invocation_outcome(
             and last.is_final_response()
             and not getattr(_event_actions(last), "transfer_to_agent", None)
         )
+    # A call left open in an invocation that went on to complete belongs to a
+    # step its caller recovered from (a nested agent's tool that raised): the
+    # run still completed.
     if closed:
         return outcome("completed", None if agent_spoke else EMPTY_REPLY)
+    if open_calls:
+        return outcome("failed", INTERRUPTED_IN_TOOL)
     return outcome("failed", INTERRUPTED)
 
 

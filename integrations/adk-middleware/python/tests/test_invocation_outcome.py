@@ -142,6 +142,14 @@ SHAPES = {
          ev("root", text="answer"), ev("root", end=True)],
         ("completed", None),
     ),
+    # The nested agent's call stays open; its caller got an error result and
+    # recovered.
+    "a nested agent's tool raised, its caller recovered": (
+        [USER, ev("root", call="explore"), ev("nested", call="search"),
+         ev("nested", error="RuntimeError"), ev("root", response="explore"),
+         ev("root", text="answer"), ev("root", end=True)],
+        ("completed", None),
+    ),
     # ADK copies a non-STOP finish_reason onto a response that has content.
     "reply cut at MAX_TOKENS": (
         [USER, ev("root", text="a long answer, cut", error="MAX_TOKENS"), ev("root", end=True)],
@@ -354,11 +362,15 @@ def test_an_answered_client_tool_is_no_longer_input_required():
         ([USER, ev("root", call="lookup"), ev("root", response="lookup"),
           ev("root", text="answer")], ("completed", None)),
         ([USER, ev("root", call="lookup"), ev("root", response="lookup")], ("failed", INTERRUPTED)),
+        ([USER, ev("root", call="slow")], ("failed", INTERRUPTED_IN_TOOL)),
+        ([USER, ev("root", call="explore"), ev("nested", call="search"),
+          ev("root", response="explore"), ev("root", text="answer")], ("completed", None)),
         ([USER, ev("root", error="SAFETY")], ("failed", "SAFETY")),
         # Without end_of_agent markers an empty reply can't be told from a kill.
         ([USER], ("failed", INTERRUPTED)),
     ],
-    ids=["reply", "tool then reply", "killed after a tool", "model error", "nothing said"],
+    ids=["reply", "tool then reply", "killed after a tool", "killed mid-tool",
+         "a nested call left open, then a reply", "model error", "nothing said"],
 )
 def test_without_resumability_a_final_response_completes(events, expected):
     assert state_and_code(outcome(*events, resumable=False)) == expected
