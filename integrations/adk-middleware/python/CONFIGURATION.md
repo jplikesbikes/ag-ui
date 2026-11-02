@@ -217,16 +217,24 @@ ADK continues the invocation with `Runner.run_async(invocation_id=...,
 new_message=None)`, and the run streams the rest of the turn:
 
 - a call left without a response by a dead process is executed again;
-- a call whose tool raised (recorded by ADK 2.x) is first closed as aborted, in
-  ADK's abort-seal shape, so the model sees that it failed and the tool is not
-  re-run (ADK 1.x records no raise, so there the call is executed again);
+- a call whose tool raised (recorded by ADK 2.x) is first sealed with the
+  failure, a `{"error": "<code>"}` response such as `{"error": "RuntimeError"}`
+  (see [USAGE.md](USAGE.md#experimental-agentsstate-endpoint)), so the model
+  sees that it failed and the tool is not re-run (ADK 1.x records no raise, so
+  there the call is executed again);
 - otherwise the model is called again. ADK 1.x does not re-run an agent it
   already closed, so there a model error response is not retried.
 
 Delivery is **at least once**: a tool that was running when the process died
 runs again, so a tool with side effects must tolerate a repeat. A completed,
 canceled, paused (`input-required`) or running invocation is never resumed;
-resuming a completed one would repeat its turn. The option needs an ADK
+resuming a completed one would repeat its turn. A retry is decided once it
+holds the thread: if a run of the thread is still executing on this instance
+(including one whose client stopped reading its stream), the retry waits for
+it and then reads the outcome again, so two retries at once resume the
+invocation once. Liveness is per process: run a single instance, or route a
+thread's requests to one instance, or a retry served by another instance can
+resume an invocation that is still running. The option needs an ADK
 resumable app and is ignored without one. It is off by default.
 
 ## Service Configuration
