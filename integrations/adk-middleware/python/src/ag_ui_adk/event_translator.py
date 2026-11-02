@@ -1957,6 +1957,18 @@ def unanswered_call_seals(events: List[Any], invocation_id: str) -> List[ADKEven
     return seals
 
 
+def _response_error_code(event: Any) -> Optional[str]:
+    """The ``error_code`` ADK recorded on a function response event, or None.
+
+    ADK marks a response that is not the tool's answer with one: an aborted
+    call's seal is ``INVOCATION_ABORTED``. Only the code is carried, as the
+    tool message's ``error``: ``error_message`` can hold exception text.
+    """
+    code = getattr(event, "error_code", None)
+    code = getattr(code, "value", code)
+    return code if isinstance(code, str) and code else None
+
+
 def adk_events_to_messages(events: List[ADKEvent]) -> List[Message]:
     """Convert ADK session events to AG-UI Message list.
 
@@ -2037,6 +2049,7 @@ def adk_events_to_messages(events: List[ADKEvent]) -> List[Message]:
 
         # Handle function responses as ToolMessages
         if function_responses:
+            response_error = _response_error_code(event)
             for index, fr in enumerate(function_responses):
                 tool_message = ToolMessage(
                     # Derived from the event, so every read of the session gives a
@@ -2044,7 +2057,8 @@ def adk_events_to_messages(events: List[ADKEvent]) -> List[Message]:
                     id=f"{event_id}-tool-{index}",
                     role="tool",
                     content=_serialize_tool_response(fr.response) if hasattr(fr, 'response') else "",
-                    tool_call_id=fr.id if hasattr(fr, 'id') and fr.id else str(uuid.uuid4())
+                    tool_call_id=fr.id if hasattr(fr, 'id') and fr.id else str(uuid.uuid4()),
+                    error=response_error,
                 )
                 messages.append(tool_message)
             continue

@@ -386,6 +386,54 @@ class TestAdkEventsToMessages:
         assert content["temperature"] == 72
         assert content["conditions"] == "sunny"
 
+    def test_an_errored_response_carries_its_code_as_the_tool_error(self):
+        """A response ADK marked with an error_code (an aborted call's seal) says so."""
+        event = ADKEvent(
+            author="test_agent",
+            invocation_id="e-1",
+            error_code="INVOCATION_ABORTED",
+            error_message="detail that must stay on the server",
+            content=types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            id="call-1",
+                            name="slow",
+                            response={"error": "Invocation was aborted by client."},
+                        )
+                    )
+                ],
+            ),
+        )
+
+        (message,) = adk_events_to_messages([event])
+
+        assert isinstance(message, ToolMessage)
+        assert message.tool_call_id == "call-1"
+        assert message.error == "INVOCATION_ABORTED"
+        assert "detail that must stay" not in message.model_dump_json()
+
+    def test_a_tool_answer_has_no_error(self):
+        event = ADKEvent(
+            author="test_agent",
+            invocation_id="e-1",
+            content=types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            id="call-1", name="lookup", response={"ok": True}
+                        )
+                    )
+                ],
+            ),
+        )
+
+        (message,) = adk_events_to_messages([event])
+
+        assert message.error is None
+
     def test_partial_events_skipped(self):
         """Should skip partial/streaming events."""
         partial_event = create_mock_adk_event(
