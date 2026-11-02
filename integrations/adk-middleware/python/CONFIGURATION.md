@@ -197,8 +197,9 @@ Set `seed_first_run_history=False` to start a new session from the latest user m
 #### Retrying a Failed Run
 
 A client retries a failed run by running again with the history it already
-sent. With nothing new to process, that run ends in an empty `RUN_STARTED` /
-`RUN_FINISHED`. Set `resume_failed_invocations=True` (on `ADKAgent` or
+sent. That history may include the messages the failed run streamed, under the
+ids it streamed them with; those count as history too. With nothing new to
+process, that run ends in an empty `RUN_STARTED` / `RUN_FINISHED`. Set `resume_failed_invocations=True` (on `ADKAgent` or
 `ADKAgent.from_app()`) to resume the thread's latest invocation instead,
 when it failed:
 

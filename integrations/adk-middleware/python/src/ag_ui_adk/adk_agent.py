@@ -2169,6 +2169,17 @@ class ADKAgent:
                         emitted_any = True
                         yield event
 
+        if not emitted_any and self._resume_failed_invocations and self._is_adk_resumable():
+            # Every batch was skipped: the unseen messages were history the session
+            # already holds under other ids (a live client re-sends the messages the
+            # failed run streamed). That is a run with nothing new, so it is a
+            # retry, as when nothing is unseen at all.
+            async for event in self._start_new_execution(
+                input, message_batch=[], resume_failed_invocation=True
+            ):
+                yield event
+            return
+
         if not emitted_any:
             # Every batch was skipped, so there is no new work to run — but the AG-UI
             # protocol still requires this run to terminate. Emit a bare terminal pair
